@@ -10,9 +10,10 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let mut config = ConnectionConfig::new("mumble.example");
-//!     config.username = "rust-bot".to_string();
-//!     config.accept_invalid_certs = true;
+//!     let config = ConnectionConfig::builder("mumble.example")
+//!         .username("rust-bot")
+//!         .accept_invalid_certs(true)
+//!         .build();
 //!
 //!     let mut connection = MumbleConnection::new(config);
 //!     connection.connect().await?;
@@ -27,5 +28,5 @@ pub mod messages;
 pub mod proto;
 pub mod state;
 
-pub use connection::{ConnectionConfig, MumbleConnection};
+pub use connection::{ConnectionConfig, ConnectionConfigBuilder, MumbleConnection};
 pub use error::MumbleError;

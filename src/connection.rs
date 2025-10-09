@@ -64,11 +64,91 @@ impl ConnectionConfig {
             client_type: 1,
         }
     }
+
+    /// Begin building a custom configuration for the given host.
+    pub fn builder(host: impl Into<String>) -> ConnectionConfigBuilder {
+        ConnectionConfigBuilder {
+            config: ConnectionConfig::new(host),
+        }
+    }
 }
 
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self::new("localhost")
+    }
+}
+
+/// Fluent builder for configuring a [`ConnectionConfig`].
+#[derive(Clone, Debug)]
+pub struct ConnectionConfigBuilder {
+    config: ConnectionConfig,
+}
+
+impl ConnectionConfigBuilder {
+    /// Override the TCP port used when connecting.
+    pub fn port(mut self, port: u16) -> Self {
+        self.config.port = port;
+        self
+    }
+
+    /// Set a custom TLS server name for SNI/certificate matching.
+    pub fn tls_server_name(mut self, name: impl Into<String>) -> Self {
+        self.config.tls_server_name = Some(name.into());
+        self
+    }
+
+    /// Configure the duration to wait for the TCP handshake.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config.connect_timeout = timeout;
+        self
+    }
+
+    /// Control whether invalid/self-signed certificates are accepted.
+    pub fn accept_invalid_certs(mut self, accept: bool) -> Self {
+        self.config.accept_invalid_certs = accept;
+        self
+    }
+
+    /// Set the username presented to the server.
+    pub fn username(mut self, username: impl Into<String>) -> Self {
+        self.config.username = username.into();
+        self
+    }
+
+    /// Provide a password used during authentication.
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.config.password = Some(password.into());
+        self
+    }
+
+    /// Clear any previously assigned password.
+    pub fn clear_password(mut self) -> Self {
+        self.config.password = None;
+        self
+    }
+
+    /// Replace the entire access token list.
+    pub fn tokens(mut self, tokens: impl Into<Vec<String>>) -> Self {
+        self.config.tokens = tokens.into();
+        self
+    }
+
+    /// Append a single access token to the configuration.
+    pub fn token(mut self, token: impl Into<String>) -> Self {
+        self.config.tokens.push(token.into());
+        self
+    }
+
+    /// Configure the client type flag (0 regular, 1 bot).
+    pub fn client_type(mut self, client_type: i32) -> Self {
+        self.config.client_type = client_type;
+        self
+    }
+
+    /// Finalise the builder, producing an owned [`ConnectionConfig`].
+    pub fn build(self) -> ConnectionConfig {
+        self.config
     }
 }
 
@@ -369,6 +449,48 @@ mod tests {
         apply_latency_metrics(&mut state, &ping);
         assert!(state.last_ping_received_ms.is_some());
         assert!(state.ping_average_ms >= 0.0);
+    }
+
+    #[test]
+    fn connection_config_builder_sets_fields() {
+        let config = ConnectionConfig::builder("example.org")
+            .port(12345)
+            .tls_server_name("server.example.org")
+            .connect_timeout(Duration::from_secs(30))
+            .accept_invalid_certs(false)
+            .username("bot")
+            .password("secret")
+            .token("alpha")
+            .token("beta")
+            .client_type(0)
+            .build();
+
+        assert_eq!(config.host, "example.org");
+        assert_eq!(config.port, 12345);
+        assert_eq!(config.tls_server_name.as_deref(), Some("server.example.org"));
+        assert_eq!(config.connect_timeout, Duration::from_secs(30));
+        assert!(!config.accept_invalid_certs);
+        assert_eq!(config.username, "bot");
+        assert_eq!(config.password.as_deref(), Some("secret"));
+        assert_eq!(config.tokens, vec!["alpha", "beta"]);
+        assert_eq!(config.client_type, 0);
+    }
+
+    #[test]
+    fn authenticate_message_contains_credentials() {
+        let config = ConnectionConfig::builder("example")
+            .username("alice")
+            .password("pw")
+            .tokens(vec!["one".into(), "two".into()])
+            .client_type(1)
+            .build();
+
+        let message = build_authenticate_message(&config);
+        assert_eq!(message.username.as_deref(), Some("alice"));
+        assert_eq!(message.password.as_deref(), Some("pw"));
+        assert_eq!(message.tokens, vec!["one", "two"]);
+        assert_eq!(message.client_type, Some(1));
+        assert_eq!(message.opus, Some(true));
     }
 }
 
