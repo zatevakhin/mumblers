@@ -28,5 +28,5 @@ pub mod messages;
 pub mod proto;
 pub mod state;
 
-pub use connection::{ConnectionConfig, ConnectionConfigBuilder, MumbleConnection};
+pub use connection::{ConnectionConfig, ConnectionConfigBuilder, MumbleConnection, MumbleEvent};
 pub use error::MumbleError;

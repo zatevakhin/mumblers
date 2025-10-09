@@ -2,7 +2,10 @@ use prost::{EncodeError, Message};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::proto::mumble::{Authenticate, Ping, Reject, ServerSync, Version};
+use crate::proto::mumble::{
+    Authenticate, ChannelRemove, ChannelState, Ping, Reject, ServerSync, TextMessage, UserRemove,
+    UserState, Version,
+};
 
 /// Protocol revision tuple (major, minor, patch) advertised to the server.
 pub const PROTOCOL_VERSION: (u32, u32, u32) = (1, 5, 735);
@@ -20,6 +23,16 @@ pub enum TcpMessageKind {
     ServerSync,
     /// Ping/Pong keepalive message.
     Ping,
+    /// Channel removal notification.
+    ChannelRemove,
+    /// Channel state update.
+    ChannelState,
+    /// User removal notification.
+    UserRemove,
+    /// User state update.
+    UserState,
+    /// Text message.
+    TextMessage,
     /// Any message that does not yet have an explicit mapping.
     Unknown(u16),
 }
@@ -33,6 +46,11 @@ impl TcpMessageKind {
             3 => TcpMessageKind::Ping,
             4 => TcpMessageKind::Reject,
             5 => TcpMessageKind::ServerSync,
+            6 => TcpMessageKind::ChannelRemove,
+            7 => TcpMessageKind::ChannelState,
+            8 => TcpMessageKind::UserRemove,
+            9 => TcpMessageKind::UserState,
+            11 => TcpMessageKind::TextMessage,
             other => TcpMessageKind::Unknown(other),
         }
     }
@@ -45,6 +63,11 @@ impl TcpMessageKind {
             TcpMessageKind::Ping => 3,
             TcpMessageKind::Reject => 4,
             TcpMessageKind::ServerSync => 5,
+            TcpMessageKind::ChannelRemove => 6,
+            TcpMessageKind::ChannelState => 7,
+            TcpMessageKind::UserRemove => 8,
+            TcpMessageKind::UserState => 9,
+            TcpMessageKind::TextMessage => 11,
             TcpMessageKind::Unknown(value) => value,
         }
     }
@@ -139,6 +162,11 @@ pub enum MumbleMessage {
     Reject(Reject),
     ServerSync(ServerSync),
     Ping(Ping),
+    ChannelRemove(ChannelRemove),
+    ChannelState(ChannelState),
+    UserRemove(UserRemove),
+    UserState(UserState),
+    TextMessage(TextMessage),
     /// Message type not yet modeled by this enum.
     Unknown(MessageEnvelope),
 }
@@ -152,6 +180,11 @@ impl MumbleMessage {
             MumbleMessage::Reject(_) => TcpMessageKind::Reject,
             MumbleMessage::ServerSync(_) => TcpMessageKind::ServerSync,
             MumbleMessage::Ping(_) => TcpMessageKind::Ping,
+            MumbleMessage::ChannelRemove(_) => TcpMessageKind::ChannelRemove,
+            MumbleMessage::ChannelState(_) => TcpMessageKind::ChannelState,
+            MumbleMessage::UserRemove(_) => TcpMessageKind::UserRemove,
+            MumbleMessage::UserState(_) => TcpMessageKind::UserState,
+            MumbleMessage::TextMessage(_) => TcpMessageKind::TextMessage,
             MumbleMessage::Unknown(envelope) => envelope.kind,
         }
     }
@@ -164,6 +197,13 @@ impl MumbleMessage {
             MumbleMessage::Reject(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
             MumbleMessage::ServerSync(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
             MumbleMessage::Ping(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
+            MumbleMessage::ChannelRemove(msg) => {
+                MessageEnvelope::try_from_message(self.kind(), msg)
+            }
+            MumbleMessage::ChannelState(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
+            MumbleMessage::UserRemove(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
+            MumbleMessage::UserState(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
+            MumbleMessage::TextMessage(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
             MumbleMessage::Unknown(envelope) => Ok(envelope.clone()),
         }
     }
@@ -216,6 +256,36 @@ impl TryFrom<MessageEnvelope> for MumbleMessage {
                 .map(MumbleMessage::Ping)
                 .map_err(|source| MessageDecodeError::Decode {
                     kind: TcpMessageKind::Ping,
+                    source,
+                })?,
+            TcpMessageKind::ChannelRemove => ChannelRemove::decode(envelope.payload.as_slice())
+                .map(MumbleMessage::ChannelRemove)
+                .map_err(|source| MessageDecodeError::Decode {
+                    kind: TcpMessageKind::ChannelRemove,
+                    source,
+                })?,
+            TcpMessageKind::ChannelState => ChannelState::decode(envelope.payload.as_slice())
+                .map(MumbleMessage::ChannelState)
+                .map_err(|source| MessageDecodeError::Decode {
+                    kind: TcpMessageKind::ChannelState,
+                    source,
+                })?,
+            TcpMessageKind::UserRemove => UserRemove::decode(envelope.payload.as_slice())
+                .map(MumbleMessage::UserRemove)
+                .map_err(|source| MessageDecodeError::Decode {
+                    kind: TcpMessageKind::UserRemove,
+                    source,
+                })?,
+            TcpMessageKind::UserState => UserState::decode(envelope.payload.as_slice())
+                .map(MumbleMessage::UserState)
+                .map_err(|source| MessageDecodeError::Decode {
+                    kind: TcpMessageKind::UserState,
+                    source,
+                })?,
+            TcpMessageKind::TextMessage => TextMessage::decode(envelope.payload.as_slice())
+                .map(MumbleMessage::TextMessage)
+                .map_err(|source| MessageDecodeError::Decode {
+                    kind: TcpMessageKind::TextMessage,
                     source,
                 })?,
             TcpMessageKind::Unknown(_) => MumbleMessage::Unknown(envelope),

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout};
 use tokio_rustls::rustls::{
@@ -19,11 +19,32 @@ use crate::error::MumbleError;
 use crate::messages::{
     read_envelope, MessageDecodeError, MessageEnvelope, MumbleMessage, TcpMessageKind,
 };
-use crate::proto::mumble::{reject::RejectType, Authenticate, Version};
+use crate::proto::mumble::{
+    reject::RejectType, Authenticate, ChannelRemove, ChannelState, TextMessage, UserRemove,
+    UserState, Version,
+};
 use crate::state::ClientState;
 
 enum ConnectionCommand {
     SendPing,
+}
+
+/// Events emitted by the connection when new control messages arrive.
+#[derive(Debug, Clone)]
+pub enum MumbleEvent {
+    Version(Version),
+    ServerSync(crate::proto::mumble::ServerSync),
+    Ping {
+        message: crate::proto::mumble::Ping,
+        round_trip_ms: Option<f64>,
+    },
+    ChannelState(ChannelState),
+    ChannelRemove(ChannelRemove),
+    UserState(UserState),
+    UserRemove(UserRemove),
+    TextMessage(TextMessage),
+    Other(MumbleMessage),
+    Unknown(MessageEnvelope),
 }
 
 /// User-provided parameters that describe how to reach a Mumble server.
@@ -160,6 +181,7 @@ pub struct MumbleConnection {
     command_tx: Option<mpsc::Sender<ConnectionCommand>>,
     shutdown_tx: Option<watch::Sender<bool>>,
     connection_task: Option<JoinHandle<()>>,
+    event_tx: broadcast::Sender<MumbleEvent>,
 }
 
 impl MumbleConnection {
@@ -173,6 +195,7 @@ impl MumbleConnection {
             command_tx: None,
             shutdown_tx: None,
             connection_task: None,
+            event_tx: broadcast::channel(32).0,
         }
     }
 
@@ -238,6 +261,7 @@ impl MumbleConnection {
 
             match message {
                 MumbleMessage::Version(version) => {
+                    let _ = self.event_tx.send(MumbleEvent::Version(version.clone()));
                     self.server_version = Some(version);
                 }
                 MumbleMessage::ServerSync(sync) => {
@@ -245,8 +269,10 @@ impl MumbleConnection {
                     state.is_connected = true;
                     state.session_id = sync.session;
                     state.max_bandwidth = sync.max_bandwidth;
-                    state.welcome_text = sync.welcome_text;
+                    state.welcome_text = sync.welcome_text.clone();
                     state.permissions = sync.permissions;
+                    drop(state);
+                    let _ = self.event_tx.send(MumbleEvent::ServerSync(sync.clone()));
                     break;
                 }
                 MumbleMessage::Reject(reject) => {
@@ -259,6 +285,21 @@ impl MumbleConnection {
                         }
                     }
                     return Err(MumbleError::Rejected(reason));
+                }
+                MumbleMessage::ChannelState(message) => {
+                    let _ = self.event_tx.send(MumbleEvent::ChannelState(message));
+                }
+                MumbleMessage::ChannelRemove(message) => {
+                    let _ = self.event_tx.send(MumbleEvent::ChannelRemove(message));
+                }
+                MumbleMessage::UserState(message) => {
+                    let _ = self.event_tx.send(MumbleEvent::UserState(message));
+                }
+                MumbleMessage::UserRemove(message) => {
+                    let _ = self.event_tx.send(MumbleEvent::UserRemove(message));
+                }
+                MumbleMessage::TextMessage(message) => {
+                    let _ = self.event_tx.send(MumbleEvent::TextMessage(message));
                 }
                 MumbleMessage::Authenticate(_)
                 | MumbleMessage::Ping(_)
@@ -282,6 +323,11 @@ impl MumbleConnection {
         self.server_version.as_ref()
     }
 
+    /// Subscribe to the stream of Mumble events.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<MumbleEvent> {
+        self.event_tx.subscribe()
+    }
+
     /// Current snapshot of the server-provided state.
     pub async fn state(&self) -> ClientState {
         self.shared_state.lock().await.clone()
@@ -303,9 +349,17 @@ impl MumbleConnection {
 
     /// Handle an inbound ping response from the server.
     pub async fn handle_pong(&self, ping: crate::proto::mumble::Ping) {
+        let round_trip = ping
+            .timestamp
+            .map(|ts| current_millis().saturating_sub(ts) as f64);
         let mut state = self.shared_state.lock().await;
         state.ping_received += 1;
         apply_latency_metrics(&mut state, &ping);
+        drop(state);
+        let _ = self.event_tx.send(MumbleEvent::Ping {
+            message: ping,
+            round_trip_ms: round_trip,
+        });
     }
 
     async fn spawn_connection_task(
@@ -322,9 +376,18 @@ impl MumbleConnection {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
 
         let shared_state = Arc::clone(&self.shared_state);
+        let event_tx = self.event_tx.clone();
 
         let handle = tokio::spawn(async move {
-            connection_loop(stream, shared_state, DEFAULT_INTERVAL, shutdown_rx, cmd_rx).await;
+            connection_loop(
+                stream,
+                shared_state,
+                event_tx,
+                DEFAULT_INTERVAL,
+                shutdown_rx,
+                cmd_rx,
+            )
+            .await;
         });
 
         self.shutdown_tx = Some(shutdown_tx);
@@ -372,6 +435,7 @@ fn apply_latency_metrics(state: &mut ClientState, ping: &crate::proto::mumble::P
 async fn connection_loop(
     mut stream: TlsStream<TcpStream>,
     state: Arc<Mutex<ClientState>>,
+    event_tx: broadcast::Sender<MumbleEvent>,
     interval_duration: Duration,
     mut shutdown: watch::Receiver<bool>,
     mut cmd_rx: mpsc::Receiver<ConnectionCommand>,
@@ -397,11 +461,7 @@ async fn connection_loop(
             result = read_envelope(&mut stream) => {
                 match result {
                     Ok(envelope) => {
-                        if let Ok(MumbleMessage::Ping(ping)) = MumbleMessage::try_from(envelope) {
-                            let mut guard = state.lock().await;
-                            guard.ping_received += 1;
-                            apply_latency_metrics(&mut guard, &ping);
-                        }
+                        handle_inbound_message(envelope, &state, &event_tx).await;
                     }
                     Err(_) => break,
                 }
@@ -435,9 +495,69 @@ async fn send_ping_internal(
         })
 }
 
+async fn handle_inbound_message(
+    envelope: MessageEnvelope,
+    state: &Arc<Mutex<ClientState>>,
+    event_tx: &broadcast::Sender<MumbleEvent>,
+) {
+    match MumbleMessage::try_from(envelope.clone()) {
+        Ok(MumbleMessage::Ping(ping)) => {
+            let round_trip = ping
+                .timestamp
+                .map(|ts| current_millis().saturating_sub(ts) as f64);
+            {
+                let mut guard = state.lock().await;
+                guard.ping_received += 1;
+                apply_latency_metrics(&mut guard, &ping);
+            }
+            let _ = event_tx.send(MumbleEvent::Ping {
+                message: ping,
+                round_trip_ms: round_trip,
+            });
+        }
+        Ok(MumbleMessage::ServerSync(sync)) => {
+            {
+                let mut guard = state.lock().await;
+                guard.is_connected = true;
+                guard.session_id = sync.session;
+                guard.max_bandwidth = sync.max_bandwidth;
+                guard.welcome_text = sync.welcome_text.clone();
+                guard.permissions = sync.permissions;
+            }
+            let _ = event_tx.send(MumbleEvent::ServerSync(sync));
+        }
+        Ok(MumbleMessage::Version(version)) => {
+            let _ = event_tx.send(MumbleEvent::Version(version));
+        }
+        Ok(MumbleMessage::ChannelState(message)) => {
+            let _ = event_tx.send(MumbleEvent::ChannelState(message));
+        }
+        Ok(MumbleMessage::ChannelRemove(message)) => {
+            let _ = event_tx.send(MumbleEvent::ChannelRemove(message));
+        }
+        Ok(MumbleMessage::UserState(message)) => {
+            let _ = event_tx.send(MumbleEvent::UserState(message));
+        }
+        Ok(MumbleMessage::UserRemove(message)) => {
+            let _ = event_tx.send(MumbleEvent::UserRemove(message));
+        }
+        Ok(MumbleMessage::TextMessage(message)) => {
+            let _ = event_tx.send(MumbleEvent::TextMessage(message));
+        }
+        Ok(other) => {
+            let _ = event_tx.send(MumbleEvent::Other(other));
+        }
+        Err(err) => {
+            tracing::warn!("failed to decode inbound message: {err}");
+            let _ = event_tx.send(MumbleEvent::Unknown(envelope));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn latency_metrics_update_average() {
@@ -467,7 +587,10 @@ mod tests {
 
         assert_eq!(config.host, "example.org");
         assert_eq!(config.port, 12345);
-        assert_eq!(config.tls_server_name.as_deref(), Some("server.example.org"));
+        assert_eq!(
+            config.tls_server_name.as_deref(),
+            Some("server.example.org")
+        );
         assert_eq!(config.connect_timeout, Duration::from_secs(30));
         assert!(!config.accept_invalid_certs);
         assert_eq!(config.username, "bot");
@@ -491,6 +614,21 @@ mod tests {
         assert_eq!(message.tokens, vec!["one", "two"]);
         assert_eq!(message.client_type, Some(1));
         assert_eq!(message.opus, Some(true));
+    }
+
+    #[tokio::test]
+    async fn handle_pong_emits_event() {
+        let connection = MumbleConnection::new(ConnectionConfig::new("localhost"));
+        let mut receiver = connection.subscribe_events();
+        let mut ping = crate::proto::mumble::Ping::default();
+        ping.timestamp = Some(super::current_millis());
+
+        connection.handle_pong(ping.clone()).await;
+
+        match receiver.recv().await.expect("event available") {
+            MumbleEvent::Ping { message, .. } => assert_eq!(message, ping),
+            other => panic!("unexpected event: {:?}", other),
+        }
     }
 }
 
