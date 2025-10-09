@@ -19,6 +19,9 @@ pub enum MumbleError {
     /// Server rejected the authentication attempt.
     #[error("server rejected connection: {0}")]
     Rejected(String),
+    /// The connection dropped unexpectedly while the heartbeat was active.
+    #[error("connection lost: {0}")]
+    ConnectionLost(&'static str),
     /// Placeholder for functionality that remains to be implemented.
     #[error("unimplemented: {0}")]
     Unimplemented(&'static str),

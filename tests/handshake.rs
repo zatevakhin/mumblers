@@ -39,7 +39,7 @@ async fn connect_when_env_provided() -> Result<(), Box<dyn std::error::Error>> {
     connection.connect().await?;
 
     assert!(connection.server_version().is_some());
-    assert!(connection.state().is_connected);
+    assert!(connection.state().await.is_connected);
 
     Ok(())
 }

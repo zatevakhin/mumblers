@@ -20,7 +20,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Connected, but server version was not received.");
     }
 
-    if let Some(welcome) = connection.state().welcome_text.as_deref() {
+    let state = connection.state().await;
+    if let Some(welcome) = state.welcome_text.as_deref() {
         println!("Welcome text: {welcome}");
     }
 

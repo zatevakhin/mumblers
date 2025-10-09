@@ -16,6 +16,7 @@
 //!
 //!     let mut connection = MumbleConnection::new(config);
 //!     connection.connect().await?;
+//!     let state = connection.state().await;
 //!     Ok(())
 //! }
 //! ```

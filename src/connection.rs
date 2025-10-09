@@ -1,10 +1,12 @@
 use std::convert::TryFrom;
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::sync::{mpsc, watch, Mutex};
+use tokio::task::JoinHandle;
+use tokio::time::{interval, timeout};
 use tokio_rustls::rustls::{
     self,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -19,6 +21,10 @@ use crate::messages::{
 };
 use crate::proto::mumble::{reject::RejectType, Authenticate, Version};
 use crate::state::ClientState;
+
+enum ConnectionCommand {
+    SendPing,
+}
 
 /// User-provided parameters that describe how to reach a Mumble server.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,19 +75,24 @@ impl Default for ConnectionConfig {
 /// Represents an async connection to a Mumble server.
 pub struct MumbleConnection {
     config: ConnectionConfig,
-    stream: Option<TlsStream<TcpStream>>,
     server_version: Option<Version>,
-    state: ClientState,
+    shared_state: Arc<Mutex<ClientState>>,
+    command_tx: Option<mpsc::Sender<ConnectionCommand>>,
+    shutdown_tx: Option<watch::Sender<bool>>,
+    connection_task: Option<JoinHandle<()>>,
 }
 
 impl MumbleConnection {
     /// Create a connection handle with the provided configuration.
     pub fn new(config: ConnectionConfig) -> Self {
+        let state = ClientState::default();
         Self {
             config,
-            stream: None,
             server_version: None,
-            state: ClientState::default(),
+            shared_state: Arc::new(Mutex::new(state)),
+            command_tx: None,
+            shutdown_tx: None,
+            connection_task: None,
         }
     }
 
@@ -150,11 +161,12 @@ impl MumbleConnection {
                     self.server_version = Some(version);
                 }
                 MumbleMessage::ServerSync(sync) => {
-                    self.state.is_connected = true;
-                    self.state.session_id = sync.session;
-                    self.state.max_bandwidth = sync.max_bandwidth;
-                    self.state.welcome_text = sync.welcome_text;
-                    self.state.permissions = sync.permissions;
+                    let mut state = self.shared_state.lock().await;
+                    state.is_connected = true;
+                    state.session_id = sync.session;
+                    state.max_bandwidth = sync.max_bandwidth;
+                    state.welcome_text = sync.welcome_text;
+                    state.permissions = sync.permissions;
                     break;
                 }
                 MumbleMessage::Reject(reject) => {
@@ -176,7 +188,7 @@ impl MumbleConnection {
             }
         }
 
-        self.stream = Some(tls_stream);
+        self.spawn_connection_task(tls_stream).await?;
         Ok(())
     }
 
@@ -191,8 +203,172 @@ impl MumbleConnection {
     }
 
     /// Current snapshot of the server-provided state.
-    pub fn state(&self) -> &ClientState {
-        &self.state
+    pub async fn state(&self) -> ClientState {
+        self.shared_state.lock().await.clone()
+    }
+
+    /// Send a ping message immediately and update latency statistics.
+    pub async fn send_ping(&mut self) -> Result<(), MumbleError> {
+        if let Some(tx) = &self.command_tx {
+            tx.send(ConnectionCommand::SendPing)
+                .await
+                .map_err(|_| MumbleError::ConnectionLost("connection task stopped"))?
+        } else {
+            return Err(MumbleError::InvalidConfig(
+                "connection not established".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Handle an inbound ping response from the server.
+    pub async fn handle_pong(&self, ping: crate::proto::mumble::Ping) {
+        let mut state = self.shared_state.lock().await;
+        state.ping_received += 1;
+        apply_latency_metrics(&mut state, &ping);
+    }
+
+    async fn spawn_connection_task(
+        &mut self,
+        stream: TlsStream<TcpStream>,
+    ) -> Result<(), MumbleError> {
+        const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
+
+        if let Some(handle) = self.connection_task.take() {
+            handle.abort();
+        }
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+
+        let shared_state = Arc::clone(&self.shared_state);
+
+        let handle = tokio::spawn(async move {
+            connection_loop(stream, shared_state, DEFAULT_INTERVAL, shutdown_rx, cmd_rx).await;
+        });
+
+        self.shutdown_tx = Some(shutdown_tx);
+        self.command_tx = Some(cmd_tx);
+        self.connection_task = Some(handle);
+        Ok(())
+    }
+}
+
+impl Drop for MumbleConnection {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(true);
+        }
+        if let Some(handle) = self.connection_task.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn current_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn apply_latency_metrics(state: &mut ClientState, ping: &crate::proto::mumble::Ping) {
+    state.last_ping_received_ms = Some(current_millis() as u128);
+    if let Some(send_ts) = ping.timestamp {
+        let now = current_millis();
+        if now > send_ts {
+            let rtt = (now - send_ts) as f64;
+            let count = state.ping_received as f64;
+            let avg = if count > 0.0 {
+                ((state.ping_average_ms * (count - 1.0)) + rtt) / count
+            } else {
+                rtt
+            };
+            state.ping_average_ms = avg;
+        }
+    }
+}
+
+async fn connection_loop(
+    mut stream: TlsStream<TcpStream>,
+    state: Arc<Mutex<ClientState>>,
+    interval_duration: Duration,
+    mut shutdown: watch::Receiver<bool>,
+    mut cmd_rx: mpsc::Receiver<ConnectionCommand>,
+) {
+    let mut ticker = interval(interval_duration);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if send_ping_internal(&mut stream, &state).await.is_err() {
+                    break;
+                }
+            }
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(ConnectionCommand::SendPing) => {
+                        if send_ping_internal(&mut stream, &state).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            result = read_envelope(&mut stream) => {
+                match result {
+                    Ok(envelope) => {
+                        if let Ok(MumbleMessage::Ping(ping)) = MumbleMessage::try_from(envelope) {
+                            let mut guard = state.lock().await;
+                            guard.ping_received += 1;
+                            apply_latency_metrics(&mut guard, &ping);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_ok() && *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn send_ping_internal(
+    stream: &mut TlsStream<TcpStream>,
+    state: &Arc<Mutex<ClientState>>,
+) -> Result<(), ()> {
+    let mut guard = state.lock().await;
+    let mut ping = crate::proto::mumble::Ping::default();
+    ping.timestamp = Some(current_millis());
+    ping.tcp_packets = Some(guard.ping_sent as u32);
+    ping.tcp_ping_avg = Some(guard.ping_average_ms as f32);
+    guard.ping_sent += 1;
+    drop(guard);
+
+    let message = MumbleMessage::Ping(ping);
+    crate::messages::write_message(stream, &message)
+        .await
+        .map_err(|err| {
+            tracing::warn!("failed to send ping: {err}");
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latency_metrics_update_average() {
+        let mut state = ClientState::default();
+        state.ping_received = 1;
+        state.ping_average_ms = 0.0;
+        let mut ping = crate::proto::mumble::Ping::default();
+        ping.timestamp = Some(current_millis().saturating_sub(5));
+        apply_latency_metrics(&mut state, &ping);
+        assert!(state.last_ping_received_ms.is_some());
+        assert!(state.ping_average_ms >= 0.0);
     }
 }
 
