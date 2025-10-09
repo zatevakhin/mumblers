@@ -23,4 +23,17 @@ pub struct ClientState {
     pub permissions: Option<u64>,
     /// Welcome text presented by the server.
     pub welcome_text: Option<String>,
+    /// Cryptographic parameters provided via CryptSetup for the UDP tunnel.
+    pub udp: Option<UdpState>,
+}
+
+/// Parameters required to initialise the UDP voice tunnel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UdpState {
+    /// Symmetric AES key.
+    pub key: Vec<u8>,
+    /// Client nonce provided by the server.
+    pub client_nonce: Vec<u8>,
+    /// Server nonce provided by the server.
+    pub server_nonce: Vec<u8>,
 }

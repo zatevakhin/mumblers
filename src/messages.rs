@@ -3,8 +3,8 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proto::mumble::{
-    Authenticate, ChannelRemove, ChannelState, Ping, Reject, ServerSync, TextMessage, UserRemove,
-    UserState, Version,
+    Authenticate, ChannelRemove, ChannelState, CryptSetup, Ping, Reject, ServerSync, TextMessage,
+    UserRemove, UserState, Version,
 };
 
 /// Protocol revision tuple (major, minor, patch) advertised to the server.
@@ -23,6 +23,8 @@ pub enum TcpMessageKind {
     ServerSync,
     /// Ping/Pong keepalive message.
     Ping,
+    /// Cryptographic setup for establishing the UDP tunnel.
+    CryptSetup,
     /// Channel removal notification.
     ChannelRemove,
     /// Channel state update.
@@ -51,6 +53,7 @@ impl TcpMessageKind {
             8 => TcpMessageKind::UserRemove,
             9 => TcpMessageKind::UserState,
             11 => TcpMessageKind::TextMessage,
+            15 => TcpMessageKind::CryptSetup,
             other => TcpMessageKind::Unknown(other),
         }
     }
@@ -68,6 +71,7 @@ impl TcpMessageKind {
             TcpMessageKind::UserRemove => 8,
             TcpMessageKind::UserState => 9,
             TcpMessageKind::TextMessage => 11,
+            TcpMessageKind::CryptSetup => 15,
             TcpMessageKind::Unknown(value) => value,
         }
     }
@@ -162,6 +166,7 @@ pub enum MumbleMessage {
     Reject(Reject),
     ServerSync(ServerSync),
     Ping(Ping),
+    CryptSetup(CryptSetup),
     ChannelRemove(ChannelRemove),
     ChannelState(ChannelState),
     UserRemove(UserRemove),
@@ -185,6 +190,7 @@ impl MumbleMessage {
             MumbleMessage::UserRemove(_) => TcpMessageKind::UserRemove,
             MumbleMessage::UserState(_) => TcpMessageKind::UserState,
             MumbleMessage::TextMessage(_) => TcpMessageKind::TextMessage,
+            MumbleMessage::CryptSetup(_) => TcpMessageKind::CryptSetup,
             MumbleMessage::Unknown(envelope) => envelope.kind,
         }
     }
@@ -197,6 +203,7 @@ impl MumbleMessage {
             MumbleMessage::Reject(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
             MumbleMessage::ServerSync(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
             MumbleMessage::Ping(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
+            MumbleMessage::CryptSetup(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
             MumbleMessage::ChannelRemove(msg) => {
                 MessageEnvelope::try_from_message(self.kind(), msg)
             }
@@ -256,6 +263,12 @@ impl TryFrom<MessageEnvelope> for MumbleMessage {
                 .map(MumbleMessage::Ping)
                 .map_err(|source| MessageDecodeError::Decode {
                     kind: TcpMessageKind::Ping,
+                    source,
+                })?,
+            TcpMessageKind::CryptSetup => CryptSetup::decode(envelope.payload.as_slice())
+                .map(MumbleMessage::CryptSetup)
+                .map_err(|source| MessageDecodeError::Decode {
+                    kind: TcpMessageKind::CryptSetup,
                     source,
                 })?,
             TcpMessageKind::ChannelRemove => ChannelRemove::decode(envelope.payload.as_slice())

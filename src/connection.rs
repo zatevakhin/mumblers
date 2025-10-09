@@ -20,10 +20,10 @@ use crate::messages::{
     read_envelope, MessageDecodeError, MessageEnvelope, MumbleMessage, TcpMessageKind,
 };
 use crate::proto::mumble::{
-    reject::RejectType, Authenticate, ChannelRemove, ChannelState, TextMessage, UserRemove,
-    UserState, Version,
+    reject::RejectType, Authenticate, ChannelRemove, ChannelState, CryptSetup, TextMessage,
+    UserRemove, UserState, Version,
 };
-use crate::state::ClientState;
+use crate::state::{ClientState, UdpState};
 
 enum ConnectionCommand {
     SendPing,
@@ -38,6 +38,7 @@ pub enum MumbleEvent {
         message: crate::proto::mumble::Ping,
         round_trip_ms: Option<f64>,
     },
+    CryptSetup(CryptSetup),
     ChannelState(ChannelState),
     ChannelRemove(ChannelRemove),
     UserState(UserState),
@@ -68,6 +69,8 @@ pub struct ConnectionConfig {
     pub tokens: Vec<String>,
     /// Client type flag (0 regular, 1 bot).
     pub client_type: i32,
+    /// Enable UDP voice tunnel negotiation once CryptSetup is received.
+    pub enable_udp: bool,
 }
 
 impl ConnectionConfig {
@@ -83,6 +86,7 @@ impl ConnectionConfig {
             password: None,
             tokens: Vec::new(),
             client_type: 1,
+            enable_udp: false,
         }
     }
 
@@ -164,6 +168,12 @@ impl ConnectionConfigBuilder {
     /// Configure the client type flag (0 regular, 1 bot).
     pub fn client_type(mut self, client_type: i32) -> Self {
         self.config.client_type = client_type;
+        self
+    }
+
+    /// Enable or disable UDP voice tunnel negotiation.
+    pub fn enable_udp(mut self, enable: bool) -> Self {
+        self.config.enable_udp = enable;
         self
     }
 
@@ -275,6 +285,20 @@ impl MumbleConnection {
                     let _ = self.event_tx.send(MumbleEvent::ServerSync(sync.clone()));
                     break;
                 }
+                MumbleMessage::CryptSetup(setup) => {
+                    {
+                        let mut state = self.shared_state.lock().await;
+                        state.udp = Some(UdpState {
+                            key: setup.key.clone().unwrap_or_default(),
+                            client_nonce: setup.client_nonce.clone().unwrap_or_default(),
+                            server_nonce: setup.server_nonce.clone().unwrap_or_default(),
+                        });
+                    }
+                    let _ = self.event_tx.send(MumbleEvent::CryptSetup(setup.clone()));
+                    if self.config.enable_udp {
+                        tracing::debug!("CryptSetup received (UDP enablement pending)");
+                    }
+                }
                 MumbleMessage::Reject(reject) => {
                     let mut reason = reject
                         .reason
@@ -331,6 +355,11 @@ impl MumbleConnection {
     /// Current snapshot of the server-provided state.
     pub async fn state(&self) -> ClientState {
         self.shared_state.lock().await.clone()
+    }
+
+    /// Return the most recently received UDP handshake parameters, if any.
+    pub async fn udp_state(&self) -> Option<UdpState> {
+        self.shared_state.lock().await.udp.clone()
     }
 
     /// Send a ping message immediately and update latency statistics.
@@ -501,6 +530,17 @@ async fn handle_inbound_message(
     event_tx: &broadcast::Sender<MumbleEvent>,
 ) {
     match MumbleMessage::try_from(envelope.clone()) {
+        Ok(MumbleMessage::CryptSetup(setup)) => {
+            {
+                let mut guard = state.lock().await;
+                guard.udp = Some(UdpState {
+                    key: setup.key.clone().unwrap_or_default(),
+                    client_nonce: setup.client_nonce.clone().unwrap_or_default(),
+                    server_nonce: setup.server_nonce.clone().unwrap_or_default(),
+                });
+            }
+            let _ = event_tx.send(MumbleEvent::CryptSetup(setup));
+        }
         Ok(MumbleMessage::Ping(ping)) => {
             let round_trip = ping
                 .timestamp
@@ -583,6 +623,7 @@ mod tests {
             .token("alpha")
             .token("beta")
             .client_type(0)
+            .enable_udp(true)
             .build();
 
         assert_eq!(config.host, "example.org");
@@ -597,6 +638,7 @@ mod tests {
         assert_eq!(config.password.as_deref(), Some("secret"));
         assert_eq!(config.tokens, vec!["alpha", "beta"]);
         assert_eq!(config.client_type, 0);
+        assert!(config.enable_udp);
     }
 
     #[test]
@@ -627,6 +669,35 @@ mod tests {
 
         match receiver.recv().await.expect("event available") {
             MumbleEvent::Ping { message, .. } => assert_eq!(message, ping),
+            other => panic!("unexpected event: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn cryptsetup_updates_state_and_emits_event() {
+        let state = Arc::new(Mutex::new(ClientState::default()));
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+
+        let mut crypt = CryptSetup::default();
+        crypt.key = Some(vec![1, 2, 3]);
+        crypt.client_nonce = Some(vec![4, 5, 6]);
+        crypt.server_nonce = Some(vec![7, 8, 9]);
+        let envelope =
+            MessageEnvelope::try_from_message(TcpMessageKind::CryptSetup, &crypt).unwrap();
+
+        handle_inbound_message(envelope, &state, &event_tx).await;
+
+        let guard = state.lock().await;
+        let udp = guard.udp.as_ref().expect("udp state");
+        assert_eq!(udp.key, vec![1, 2, 3]);
+        assert_eq!(udp.client_nonce, vec![4, 5, 6]);
+        assert_eq!(udp.server_nonce, vec![7, 8, 9]);
+        drop(guard);
+
+        match event_rx.recv().await.expect("event message") {
+            MumbleEvent::CryptSetup(event) => {
+                assert_eq!(event.key, Some(vec![1, 2, 3]));
+            }
             other => panic!("unexpected event: {:?}", other),
         }
     }
