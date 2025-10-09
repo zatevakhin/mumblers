@@ -1,0 +1,317 @@
+use prost::{EncodeError, Message};
+use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::proto::mumble::{Authenticate, Ping, Reject, ServerSync, Version};
+
+/// Protocol revision tuple (major, minor, patch) advertised to the server.
+pub const PROTOCOL_VERSION: (u32, u32, u32) = (1, 5, 735);
+
+/// High-level message identifier for TCP traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpMessageKind {
+    /// Server's initial Version message.
+    Version,
+    /// Authentication payload containing username, password, and tokens.
+    Authenticate,
+    /// Server rejected the connection attempt.
+    Reject,
+    /// Server synchronization payload delivered post-authentication.
+    ServerSync,
+    /// Ping/Pong keepalive message.
+    Ping,
+    /// Any message that does not yet have an explicit mapping.
+    Unknown(u16),
+}
+
+impl TcpMessageKind {
+    /// Construct a message kind from its wire identifier.
+    pub fn from_id(value: u16) -> Self {
+        match value {
+            0 => TcpMessageKind::Version,
+            2 => TcpMessageKind::Authenticate,
+            3 => TcpMessageKind::Ping,
+            4 => TcpMessageKind::Reject,
+            5 => TcpMessageKind::ServerSync,
+            other => TcpMessageKind::Unknown(other),
+        }
+    }
+
+    /// Return the numeric identifier associated with this message kind.
+    pub fn as_id(self) -> u16 {
+        match self {
+            TcpMessageKind::Version => 0,
+            TcpMessageKind::Authenticate => 2,
+            TcpMessageKind::Ping => 3,
+            TcpMessageKind::Reject => 4,
+            TcpMessageKind::ServerSync => 5,
+            TcpMessageKind::Unknown(value) => value,
+        }
+    }
+}
+
+/// Placeholder for the eventual strongly typed message abstraction.
+#[derive(Debug, Clone)]
+pub struct MessageEnvelope {
+    /// Message identifier.
+    pub kind: TcpMessageKind,
+    /// Serialized protobuf payload.
+    pub payload: Vec<u8>,
+}
+
+impl MessageEnvelope {
+    /// Build an envelope from raw parts.
+    pub fn new(kind: TcpMessageKind, payload: Vec<u8>) -> Self {
+        Self { kind, payload }
+    }
+
+    /// Build an envelope from a protobuf message.
+    pub fn try_from_message<M: Message>(
+        kind: TcpMessageKind,
+        message: &M,
+    ) -> Result<Self, EncodeError> {
+        let mut payload = Vec::new();
+        message.encode(&mut payload)?;
+        Ok(Self { kind, payload })
+    }
+
+    /// Attempt to decode the payload as a Version message.
+    pub fn decode_version(&self) -> Option<Version> {
+        if self.kind != TcpMessageKind::Version {
+            return None;
+        }
+        Version::decode(self.payload.as_slice()).ok()
+    }
+
+    /// Serialize the message envelope to the provided async writer.
+    pub async fn write_to<W>(&self, writer: &mut W) -> Result<(), std::io::Error>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let id = self.kind.as_id();
+        let length = self.payload.len() as u32;
+
+        let mut header = [0u8; 6];
+        header[..2].copy_from_slice(&id.to_be_bytes());
+        header[2..].copy_from_slice(&length.to_be_bytes());
+
+        writer.write_all(&header).await?;
+        writer.write_all(&self.payload).await?;
+
+        Ok(())
+    }
+
+    /// Serialize the envelope into a contiguous byte buffer.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(6 + self.payload.len());
+        bytes.extend_from_slice(&self.kind.as_id().to_be_bytes());
+        bytes.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&self.payload);
+        bytes
+    }
+}
+
+/// Read a single message from the wire using the standard Mumble framing.
+pub async fn read_envelope<R>(reader: &mut R) -> Result<MessageEnvelope, std::io::Error>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0u8; 6];
+    reader.read_exact(&mut header).await?;
+
+    let msg_type = u16::from_be_bytes([header[0], header[1]]);
+    let length = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
+
+    let mut payload = vec![0u8; length];
+    reader.read_exact(&mut payload).await?;
+
+    Ok(MessageEnvelope::new(
+        TcpMessageKind::from_id(msg_type),
+        payload,
+    ))
+}
+
+/// Fully typed representation of a TCP control message.
+#[derive(Debug, Clone)]
+pub enum MumbleMessage {
+    Version(Version),
+    Authenticate(Authenticate),
+    Reject(Reject),
+    ServerSync(ServerSync),
+    Ping(Ping),
+    /// Message type not yet modeled by this enum.
+    Unknown(MessageEnvelope),
+}
+
+impl MumbleMessage {
+    /// Return the message identifier corresponding to this variant.
+    pub fn kind(&self) -> TcpMessageKind {
+        match self {
+            MumbleMessage::Version(_) => TcpMessageKind::Version,
+            MumbleMessage::Authenticate(_) => TcpMessageKind::Authenticate,
+            MumbleMessage::Reject(_) => TcpMessageKind::Reject,
+            MumbleMessage::ServerSync(_) => TcpMessageKind::ServerSync,
+            MumbleMessage::Ping(_) => TcpMessageKind::Ping,
+            MumbleMessage::Unknown(envelope) => envelope.kind,
+        }
+    }
+
+    /// Convert the message into a framed envelope ready to send on the wire.
+    pub fn encode(&self) -> Result<MessageEnvelope, EncodeError> {
+        match self {
+            MumbleMessage::Version(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
+            MumbleMessage::Authenticate(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
+            MumbleMessage::Reject(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
+            MumbleMessage::ServerSync(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
+            MumbleMessage::Ping(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
+            MumbleMessage::Unknown(envelope) => Ok(envelope.clone()),
+        }
+    }
+}
+
+/// Errors that can occur while decoding a `MessageEnvelope` into a `MumbleMessage`.
+#[derive(Debug, Error)]
+pub enum MessageDecodeError {
+    /// Protobuf decoding failed for the given message type.
+    #[error("failed to decode {kind:?}: {source}")]
+    Decode {
+        /// Message identifier that failed to decode.
+        kind: TcpMessageKind,
+        /// Underlying protobuf decode error.
+        #[source]
+        source: prost::DecodeError,
+    },
+}
+
+impl TryFrom<MessageEnvelope> for MumbleMessage {
+    type Error = MessageDecodeError;
+
+    fn try_from(envelope: MessageEnvelope) -> Result<Self, Self::Error> {
+        let result = match envelope.kind {
+            TcpMessageKind::Version => Version::decode(envelope.payload.as_slice())
+                .map(MumbleMessage::Version)
+                .map_err(|source| MessageDecodeError::Decode {
+                    kind: TcpMessageKind::Version,
+                    source,
+                })?,
+            TcpMessageKind::Authenticate => Authenticate::decode(envelope.payload.as_slice())
+                .map(MumbleMessage::Authenticate)
+                .map_err(|source| MessageDecodeError::Decode {
+                    kind: TcpMessageKind::Authenticate,
+                    source,
+                })?,
+            TcpMessageKind::Reject => Reject::decode(envelope.payload.as_slice())
+                .map(MumbleMessage::Reject)
+                .map_err(|source| MessageDecodeError::Decode {
+                    kind: TcpMessageKind::Reject,
+                    source,
+                })?,
+            TcpMessageKind::ServerSync => ServerSync::decode(envelope.payload.as_slice())
+                .map(MumbleMessage::ServerSync)
+                .map_err(|source| MessageDecodeError::Decode {
+                    kind: TcpMessageKind::ServerSync,
+                    source,
+                })?,
+            TcpMessageKind::Ping => Ping::decode(envelope.payload.as_slice())
+                .map(MumbleMessage::Ping)
+                .map_err(|source| MessageDecodeError::Decode {
+                    kind: TcpMessageKind::Ping,
+                    source,
+                })?,
+            TcpMessageKind::Unknown(_) => MumbleMessage::Unknown(envelope),
+        };
+        Ok(result)
+    }
+}
+
+/// Encode and write a typed message to the provided writer.
+pub async fn write_message<W>(writer: &mut W, message: &MumbleMessage) -> Result<(), std::io::Error>
+where
+    W: AsyncWrite + Unpin,
+{
+    let envelope = message
+        .encode()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    envelope.write_to(writer).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    fn golden_version_message() -> Version {
+        let mut version = Version::default();
+        version.version_v1 = Some(1);
+        version.release = Some("rs".into());
+        version
+    }
+
+    #[test]
+    fn decode_version_payload() {
+        let mut version = Version::default();
+        version.version_v1 = Some(0x0105_00ff);
+        version.release = Some("mumble-rs".into());
+
+        let envelope = MessageEnvelope::try_from_message(TcpMessageKind::Version, &version)
+            .expect("encoding should succeed");
+        let decoded = envelope.decode_version().expect("should parse version");
+
+        assert_eq!(decoded.release.as_deref(), Some("mumble-rs"));
+    }
+
+    #[tokio::test]
+    async fn write_and_read_roundtrip() {
+        let (mut tx, mut rx) = duplex(64);
+
+        let mut version = Version::default();
+        version.version_v1 = Some(0x0105_0001);
+
+        let envelope = MessageEnvelope::try_from_message(TcpMessageKind::Version, &version)
+            .expect("encoding should succeed");
+        let expected_payload = envelope.payload.clone();
+        envelope.write_to(&mut tx).await.unwrap();
+
+        let received = super::read_envelope(&mut rx).await.unwrap();
+        assert_eq!(received.kind, TcpMessageKind::Version);
+        assert_eq!(received.payload, expected_payload);
+    }
+
+    #[test]
+    fn envelope_to_bytes_produces_expected_header() {
+        let version = golden_version_message();
+        let envelope =
+            MessageEnvelope::try_from_message(TcpMessageKind::Version, &version).unwrap();
+        let bytes = envelope.to_bytes();
+
+        assert_eq!(
+            bytes,
+            vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x08, 0x01, 0x12, 0x02, 0x72, 0x73]
+        );
+    }
+
+    #[test]
+    fn message_try_from_envelope_handles_unknown() {
+        let envelope = MessageEnvelope::new(TcpMessageKind::Unknown(42), vec![1, 2, 3]);
+        let message = MumbleMessage::try_from(envelope.clone()).unwrap();
+        match message {
+            MumbleMessage::Unknown(inner) => {
+                assert_eq!(inner.kind, TcpMessageKind::Unknown(42));
+                assert_eq!(inner.payload, vec![1, 2, 3]);
+            }
+            other => panic!("unexpected variant {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_roundtrip_encoding() {
+        let version = golden_version_message();
+        let message = MumbleMessage::Version(version.clone());
+        let envelope = message.encode().unwrap();
+        let decoded = MumbleMessage::try_from(envelope).unwrap();
+        match decoded {
+            MumbleMessage::Version(decoded_version) => assert_eq!(decoded_version, version),
+            _ => panic!("expected Version message"),
+        }
+    }
+}
