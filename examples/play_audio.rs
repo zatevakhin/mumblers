@@ -12,7 +12,7 @@ use hound::WavReader;
 #[cfg(feature = "audio")]
 use mumble_rs::{AudioEncoder, ConnectionConfig, MumbleConnection};
 #[cfg(feature = "audio")]
-use tokio::time::sleep;
+use tokio::time::{interval, MissedTickBehavior};
 
 #[cfg(feature = "audio")]
 #[derive(Parser, Debug)]
@@ -70,12 +70,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut encoder = AudioEncoder::with_codec(0, negotiated_codec.as_ref())?;
+    let state = connection.state().await;
+    encoder
+        .set_bandwidth_limit(state.max_bandwidth)
+        .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
     let frame_size = encoder.frame_size();
     let mut frame = Vec::with_capacity(frame_size);
+    let mut ticker = interval(Duration::from_millis(20));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Burst);
 
     for sample in reader.samples::<i16>() {
         frame.push(sample?);
         if frame.len() == frame_size {
+            ticker.tick().await;
             send_frame(&connection, &mut encoder, &frame).await?;
             frame.clear();
         }
@@ -83,6 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !frame.is_empty() {
         frame.resize(frame_size, 0);
+        ticker.tick().await;
         send_frame(&connection, &mut encoder, &frame).await?;
     }
 
@@ -98,7 +106,6 @@ async fn send_frame(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let packet = encoder.encode_frame(samples)?;
     connection.send_audio(packet).await?;
-    sleep(Duration::from_millis(20)).await;
     Ok(())
 }
 

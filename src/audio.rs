@@ -128,6 +128,16 @@ const FRAME_DURATION_DOUBLE: Duration = Duration::from_millis((AUDIO_FRAME_MS as
 const FRAME_TICKS: u64 = (AUDIO_FRAME_MS as u64) / SEQUENCE_TICK_MS;
 #[cfg(feature = "audio")]
 const MAX_COMPRESSED_SIZE: usize = 4 * 1024;
+#[cfg(feature = "audio")]
+const UDP_OVERHEAD_BYTES_PER_PACKET: u32 = 35;
+#[cfg(feature = "audio")]
+const UDP_OVERHEAD_BITS_PER_PACKET: u32 = UDP_OVERHEAD_BYTES_PER_PACKET * 8;
+#[cfg(feature = "audio")]
+const PACKETS_PER_SECOND: u32 = 1000 / AUDIO_FRAME_MS;
+#[cfg(feature = "audio")]
+const UDP_OVERHEAD_BITS_PER_SECOND: u32 = UDP_OVERHEAD_BITS_PER_PACKET * PACKETS_PER_SECOND;
+#[cfg(feature = "audio")]
+const MIN_AUDIO_BITRATE: u32 = 6_000;
 
 /// Stateful Opus encoder that mirrors pymumble's default audio settings.
 #[cfg(feature = "audio")]
@@ -140,6 +150,7 @@ pub struct AudioEncoder {
     sequence: u64,
     sequence_start: Option<Instant>,
     sequence_last: Option<Instant>,
+    bandwidth_limit: Option<u32>,
 }
 
 #[cfg(feature = "audio")]
@@ -167,6 +178,7 @@ impl AudioEncoder {
             sequence: 0,
             sequence_start: None,
             sequence_last: None,
+            bandwidth_limit: None,
         })
     }
 
@@ -195,6 +207,30 @@ impl AudioEncoder {
         self.sequence = 0;
         self.sequence_start = None;
         self.sequence_last = None;
+    }
+
+    /// Apply the negotiated bandwidth limit and adjust the encoder bitrate.
+    ///
+    /// The server's `max_bandwidth` value is expressed in bits per second. We subtract
+    /// protocol overhead approximated from pymumble to derive the Opus target bitrate.
+    pub fn set_bandwidth_limit(
+        &mut self,
+        total_bits_per_second: Option<u32>,
+    ) -> Result<(), AudioEncodeError> {
+        self.bandwidth_limit = total_bits_per_second;
+        match total_bits_per_second {
+            Some(total) => {
+                let effective = total
+                    .saturating_sub(UDP_OVERHEAD_BITS_PER_SECOND)
+                    .max(MIN_AUDIO_BITRATE)
+                    .min(i32::MAX as u32) as i32;
+                self.encoder.set_bitrate(Bitrate::Bits(effective))?;
+            }
+            None => {
+                self.encoder.set_bitrate(Bitrate::Auto)?;
+            }
+        }
+        Ok(())
     }
 
     /// Encode a PCM frame (16-bit little endian) into a [`VoicePacket`].
