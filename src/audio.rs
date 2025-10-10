@@ -10,7 +10,9 @@ use crate::proto::mumble_udp;
 #[cfg(feature = "audio")]
 use crate::proto::mumble::CodecVersion;
 #[cfg(feature = "audio")]
-use opus::{Application, Bitrate, Channels, Encoder as OpusEncoder};
+use opus::{Application, Bitrate, Channels, Decoder as OpusDecoder, Encoder as OpusEncoder};
+#[cfg(feature = "audio")]
+use std::collections::VecDeque;
 #[cfg(feature = "audio")]
 use std::time::{Duration, Instant};
 #[cfg(feature = "audio")]
@@ -138,6 +140,8 @@ const PACKETS_PER_SECOND: u32 = 1000 / AUDIO_FRAME_MS;
 const UDP_OVERHEAD_BITS_PER_SECOND: u32 = UDP_OVERHEAD_BITS_PER_PACKET * PACKETS_PER_SECOND;
 #[cfg(feature = "audio")]
 const MIN_AUDIO_BITRATE: u32 = 6_000;
+#[cfg(feature = "audio")]
+const MAX_DECODE_SAMPLES: usize = (SAMPLE_RATE as usize / 1000) * 120;
 
 /// Stateful Opus encoder that mirrors pymumble's default audio settings.
 #[cfg(feature = "audio")]
@@ -315,6 +319,171 @@ pub enum AudioEncodeError {
     Opus(#[from] opus::Error),
 }
 
+/// Errors that can occur while decoding Opus packets from the network.
+#[cfg(feature = "audio")]
+#[derive(Debug, Error)]
+pub enum AudioDecodeError {
+    /// Unsupported or invalid codec payload encountered.
+    #[error("unsupported audio codec")]
+    UnsupportedCodec,
+    /// Underlying Opus decoder failure.
+    #[error(transparent)]
+    Opus(#[from] opus::Error),
+}
+
+/// Decoded audio frame coupled with scheduling metadata for jitter buffering.
+#[cfg(feature = "audio")]
+#[derive(Clone, Debug)]
+pub struct SoundChunk {
+    /// Raw PCM data decoded to 16-bit mono.
+    pub pcm: Vec<i16>,
+    /// Monotonic frame number as supplied by the sender.
+    pub frame_number: u64,
+    /// Voice routing header.
+    pub header: AudioHeader,
+    /// Session identifier of the sender, when provided.
+    pub sender_session: Option<u32>,
+    /// Timestamp when this chunk arrived locally.
+    pub arrival_time: Instant,
+    /// Scheduled playout time derived from the frame sequence numbers.
+    pub target_playback_time: Instant,
+    /// Duration of the PCM slice.
+    pub duration: Duration,
+}
+
+/// Jitter-buffer queue that mirrors pymumble's receive-side ordering logic.
+#[cfg(feature = "audio")]
+pub struct ReceivedAudioQueue {
+    decoder: OpusDecoder,
+    queue: VecDeque<SoundChunk>,
+    start_sequence: Option<u64>,
+    start_time: Option<Instant>,
+    receive_sound: bool,
+}
+
+#[cfg(feature = "audio")]
+impl ReceivedAudioQueue {
+    /// Create a new queue configured for 48 kHz mono Opus streams.
+    pub fn new() -> Result<Self, AudioDecodeError> {
+        let decoder = OpusDecoder::new(SAMPLE_RATE, Channels::Mono)?;
+        Ok(Self {
+            decoder,
+            queue: VecDeque::new(),
+            start_sequence: None,
+            start_time: None,
+            receive_sound: true,
+        })
+    }
+
+    /// Enable or disable buffering of received audio.
+    pub fn set_receive_sound(&mut self, value: bool) {
+        self.receive_sound = value;
+        if !value {
+            self.queue.clear();
+        }
+    }
+
+    /// Return the number of buffered chunks waiting to be played.
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// True when no chunks are buffered.
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Drop all buffered audio.
+    pub fn clear(&mut self) {
+        self.queue.clear();
+    }
+
+    /// Access the next chunk scheduled for playout without removing it.
+    pub fn front(&self) -> Option<&SoundChunk> {
+        self.queue.front()
+    }
+
+    /// Pop the next chunk scheduled for playout if its target time has arrived.
+    pub fn pop_ready(&mut self, now: Instant) -> Option<SoundChunk> {
+        if let Some(chunk) = self.queue.front() {
+            if chunk.target_playback_time <= now {
+                return self.queue.pop_front();
+            }
+        }
+        None
+    }
+
+    /// Pop the next buffered chunk regardless of its target time.
+    pub fn pop_front(&mut self) -> Option<SoundChunk> {
+        self.queue.pop_front()
+    }
+
+    /// Decode an inbound voice packet and enqueue it for ordered playout.
+    ///
+    /// Returns the decoded chunk for immediate inspection.
+    pub fn add(&mut self, packet: &VoicePacket) -> Result<Option<SoundChunk>, AudioDecodeError> {
+        if !self.receive_sound {
+            return Ok(None);
+        }
+
+        let chunk = self.decode_packet(packet)?;
+        self.enqueue(chunk.clone());
+        Ok(Some(chunk))
+    }
+
+    fn decode_packet(&mut self, packet: &VoicePacket) -> Result<SoundChunk, AudioDecodeError> {
+        let arrival = Instant::now();
+
+        let mut buffer = vec![0i16; MAX_DECODE_SAMPLES];
+        let samples = self.decoder.decode(&packet.opus_data, &mut buffer, false)?;
+        buffer.truncate(samples);
+
+        let duration = if samples == 0 {
+            Duration::from_millis(0)
+        } else {
+            Duration::from_secs_f64(samples as f64 / SAMPLE_RATE as f64)
+        };
+
+        let target_playback_time = self.compute_target_time(packet.frame_number, arrival);
+
+        Ok(SoundChunk {
+            pcm: buffer,
+            frame_number: packet.frame_number,
+            header: packet.header,
+            sender_session: packet.sender_session,
+            arrival_time: arrival,
+            target_playback_time,
+            duration,
+        })
+    }
+
+    fn compute_target_time(&mut self, frame_number: u64, arrival: Instant) -> Instant {
+        match (self.start_sequence, self.start_time) {
+            (Some(start_seq), Some(start_time)) if frame_number > start_seq => {
+                let ticks = frame_number.saturating_sub(start_seq);
+                let offset = Duration::from_millis(ticks.saturating_mul(SEQUENCE_TICK_MS));
+                start_time + offset
+            }
+            _ => {
+                self.start_sequence = Some(frame_number);
+                self.start_time = Some(arrival);
+                arrival
+            }
+        }
+    }
+
+    fn enqueue(&mut self, chunk: SoundChunk) {
+        let position = self
+            .queue
+            .iter()
+            .position(|existing| existing.target_playback_time > chunk.target_playback_time);
+        match position {
+            Some(index) => self.queue.insert(index, chunk),
+            None => self.queue.push_back(chunk),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +545,22 @@ mod audio_feature_tests {
         assert_eq!(packet.frame_number, 0);
         assert_eq!(packet.header, AudioHeader::Target(0));
         assert!(!packet.opus_data.is_empty());
+    }
+
+    #[test]
+    fn received_queue_orders_frames() {
+        let mut encoder = AudioEncoder::new(0).expect("encoder");
+        let frame = vec![0i16; encoder.frame_size()];
+        let first = encoder.encode_frame(&frame).expect("encode first");
+        let second = encoder.encode_frame(&frame).expect("encode second");
+
+        let mut queue = ReceivedAudioQueue::new().expect("queue");
+        queue.add(&second).expect("second");
+        queue.add(&first).expect("first");
+
+        let chunk1 = queue.pop_front().expect("pop first");
+        assert_eq!(chunk1.frame_number, first.frame_number);
+        let chunk2 = queue.pop_front().expect("pop second");
+        assert_eq!(chunk2.frame_number, second.frame_number);
     }
 }

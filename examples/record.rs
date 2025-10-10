@@ -10,16 +10,12 @@ use clap::Parser;
 #[cfg(feature = "audio")]
 use hound::{SampleFormat, WavSpec, WavWriter};
 #[cfg(feature = "audio")]
-use mumble_rs::{ConnectionConfig, MumbleConnection, MumbleEvent};
-#[cfg(feature = "audio")]
-use opus::{Channels, Decoder as OpusDecoder};
+use mumble_rs::{ConnectionConfig, MumbleConnection, MumbleEvent, ReceivedAudioQueue, VoicePacket};
 #[cfg(feature = "audio")]
 use tokio::sync::Mutex;
 
 #[cfg(feature = "audio")]
 const SAMPLE_RATE: u32 = 48_000;
-#[cfg(feature = "audio")]
-const MAX_FRAME_SAMPLES: usize = (SAMPLE_RATE as usize / 1000) * 120;
 
 #[cfg(feature = "audio")]
 /// Capture UDP audio packets, decode them with Opus, and persist to a WAV file.
@@ -39,14 +35,14 @@ struct Args {
 
 #[cfg(feature = "audio")]
 struct Recorder {
-    decoder: Mutex<OpusDecoder>,
+    queue: Mutex<ReceivedAudioQueue>,
     writer: Mutex<WavWriter<std::io::BufWriter<std::fs::File>>>,
 }
 
 #[cfg(feature = "audio")]
 impl Recorder {
     fn new(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
-        let decoder = OpusDecoder::new(SAMPLE_RATE, Channels::Mono)?;
+        let queue = ReceivedAudioQueue::new()?;
         let spec = WavSpec {
             channels: 1,
             sample_rate: SAMPLE_RATE,
@@ -55,20 +51,61 @@ impl Recorder {
         };
         let writer = WavWriter::create(path, spec)?;
         Ok(Self {
-            decoder: Mutex::new(decoder),
+            queue: Mutex::new(queue),
             writer: Mutex::new(writer),
         })
     }
 
-    async fn write_frame(&self, opus_frame: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-        let mut decoder = self.decoder.lock().await;
-        let mut pcm = vec![0i16; MAX_FRAME_SAMPLES];
-        let samples_written = decoder.decode(opus_frame, &mut pcm, false)?;
-        drop(decoder);
+    async fn ingest_packet(&self, packet: &VoicePacket) -> Result<(), Box<dyn std::error::Error>> {
+        {
+            let mut queue = self.queue.lock().await;
+            queue.add(packet)?;
+        }
+        self.flush_ready().await
+    }
+
+    async fn flush_ready(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let ready_chunks = {
+            let mut queue = self.queue.lock().await;
+            let now = Instant::now();
+            let mut ready = Vec::new();
+            while let Some(chunk) = queue.pop_ready(now) {
+                ready.push(chunk);
+            }
+            ready
+        };
+
+        if ready_chunks.is_empty() {
+            return Ok(());
+        }
 
         let mut writer = self.writer.lock().await;
-        for sample in pcm.into_iter().take(samples_written) {
-            writer.write_sample(sample)?;
+        for chunk in ready_chunks {
+            for sample in chunk.pcm {
+                writer.write_sample(sample)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn flush_all(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let remaining = {
+            let mut queue = self.queue.lock().await;
+            let mut drained = Vec::new();
+            while let Some(chunk) = queue.pop_front() {
+                drained.push(chunk);
+            }
+            drained
+        };
+        if remaining.is_empty() {
+            return Ok(());
+        }
+
+        let mut writer = self.writer.lock().await;
+        for chunk in remaining {
+            for sample in chunk.pcm {
+                writer.write_sample(sample)?;
+            }
         }
         Ok(())
     }
@@ -150,6 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    recorder.flush_all().await?;
     recorder.finalize()?;
     println!(
         "Recording complete. Captured audio written to {}",
@@ -167,12 +205,11 @@ async fn handle_event(
         MumbleEvent::UdpAudio(packet) => {
             let frame_number = packet.frame_number;
             let payload_len = packet.opus_data.len();
-            let opus = packet.opus_data;
             println!(
                 "Event: UdpAudio {{ frame: {}, bytes: {} }}",
                 frame_number, payload_len
             );
-            recorder.write_frame(&opus).await?;
+            recorder.ingest_packet(&packet).await?;
         }
         MumbleEvent::UdpPing(ping) => {
             println!("Event: UdpPing({ping:?})");
