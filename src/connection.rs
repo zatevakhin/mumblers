@@ -1,9 +1,9 @@
 use std::convert::TryFrom;
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 #[cfg(feature = "audio")]
 use std::time::Instant;
+use std::time::{Duration, SystemTime};
 
 use rand::{rngs::OsRng, RngCore};
 use tokio::net::TcpStream;
@@ -84,6 +84,37 @@ pub enum MumbleEvent {
     Unknown(MessageEnvelope),
 }
 
+/// Identifies the type of client connecting to the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientType {
+    Regular = 0,
+    Bot = 1,
+}
+
+impl Default for ClientType {
+    fn default() -> Self {
+        ClientType::Bot
+    }
+}
+
+impl From<ClientType> for i32 {
+    fn from(value: ClientType) -> Self {
+        value as i32
+    }
+}
+
+impl TryFrom<i32> for ClientType {
+    type Error = &'static str;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(ClientType::Regular),
+            1 => Ok(ClientType::Bot),
+            _ => Err("invalid client type"),
+        }
+    }
+}
+
 /// User-provided parameters that describe how to reach a Mumble server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionConfig {
@@ -104,7 +135,7 @@ pub struct ConnectionConfig {
     /// Additional access tokens supplied during authentication.
     pub tokens: Vec<String>,
     /// Client type flag (0 regular, 1 bot).
-    pub client_type: i32,
+    pub client_type: ClientType,
     /// Enable UDP voice tunnel negotiation once CryptSetup is received.
     pub enable_udp: bool,
 }
@@ -121,7 +152,7 @@ impl ConnectionConfig {
             username: "mumble-rs".to_string(),
             password: None,
             tokens: Vec::new(),
-            client_type: 1,
+            client_type: ClientType::Bot,
             enable_udp: false,
         }
     }
@@ -202,7 +233,7 @@ impl ConnectionConfigBuilder {
     }
 
     /// Configure the client type flag (0 regular, 1 bot).
-    pub fn client_type(mut self, client_type: i32) -> Self {
+    pub fn client_type(mut self, client_type: ClientType) -> Self {
         self.config.client_type = client_type;
         self
     }
@@ -1051,7 +1082,7 @@ mod tests {
             .password("secret")
             .token("alpha")
             .token("beta")
-            .client_type(0)
+            .client_type(ClientType::Regular)
             .enable_udp(true)
             .build();
 
@@ -1066,7 +1097,7 @@ mod tests {
         assert_eq!(config.username, "bot");
         assert_eq!(config.password.as_deref(), Some("secret"));
         assert_eq!(config.tokens, vec!["alpha", "beta"]);
-        assert_eq!(config.client_type, 0);
+        assert_eq!(config.client_type, ClientType::Regular);
         assert!(config.enable_udp);
     }
 
@@ -1076,14 +1107,14 @@ mod tests {
             .username("alice")
             .password("pw")
             .tokens(vec!["one".into(), "two".into()])
-            .client_type(1)
+            .client_type(ClientType::Bot)
             .build();
 
         let message = build_authenticate_message(&config);
         assert_eq!(message.username.as_deref(), Some("alice"));
         assert_eq!(message.password.as_deref(), Some("pw"));
         assert_eq!(message.tokens, vec!["one", "two"]);
-        assert_eq!(message.client_type, Some(1));
+        assert_eq!(message.client_type, Some(i32::from(ClientType::Bot)));
         assert_eq!(message.opus, Some(true));
     }
 
@@ -1279,7 +1310,7 @@ fn build_authenticate_message(config: &ConnectionConfig) -> Authenticate {
     }
     auth.tokens = config.tokens.clone();
     auth.opus = Some(true);
-    auth.client_type = Some(config.client_type);
+    auth.client_type = Some(i32::from(config.client_type));
     auth
 }
 

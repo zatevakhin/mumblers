@@ -10,7 +10,9 @@ use clap::Parser;
 #[cfg(feature = "audio")]
 use hound::{SampleFormat, WavSpec, WavWriter};
 #[cfg(feature = "audio")]
-use mumble_rs::{ConnectionConfig, MumbleConnection, MumbleEvent, ReceivedAudioQueue, VoicePacket};
+use mumble_rs::{
+    ClientType, ConnectionConfig, MumbleConnection, MumbleEvent, ReceivedAudioQueue, VoicePacket,
+};
 #[cfg(feature = "audio")]
 use tokio::sync::Mutex;
 
@@ -132,7 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(password) = std::env::var("MUMBLE_PASSWORD") {
         config.password = Some(password);
     }
-    config.client_type = 0;
+    config.client_type = ClientType::Regular;
 
     let recorder = Recorder::new(&args.output)?;
 

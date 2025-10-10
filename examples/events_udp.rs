@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use mumble_rs::{ConnectionConfig, MumbleConnection, MumbleEvent};
+use mumble_rs::{ClientType, ConnectionConfig, MumbleConnection, MumbleEvent};
 
 /// Listen for UDP-capable Mumble events and print them to stdout.
 ///
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(password) = std::env::var("MUMBLE_PASSWORD") {
         config.password = Some(password);
     }
-    config.client_type = 0;
+    config.client_type = ClientType::Regular;
 
     let mut connection = MumbleConnection::new(config);
     connection.connect().await?;

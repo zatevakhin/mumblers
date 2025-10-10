@@ -37,7 +37,9 @@ pub use audio::{
     SoundChunk,
 };
 pub use audio::{AudioHeader, VoicePacket};
-pub use connection::{ConnectionConfig, ConnectionConfigBuilder, MumbleConnection, MumbleEvent};
+pub use connection::{
+    ClientType, ConnectionConfig, ConnectionConfigBuilder, MumbleConnection, MumbleEvent,
+};
 pub use crypto::ocb2::{
     CryptStateOcb2, DecryptError as OcbDecryptError, EncryptError as OcbEncryptError,
 };

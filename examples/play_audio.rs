@@ -10,7 +10,7 @@ use clap::Parser;
 #[cfg(feature = "audio")]
 use hound::WavReader;
 #[cfg(feature = "audio")]
-use mumble_rs::{AudioEncoder, ConnectionConfig, MumbleConnection};
+use mumble_rs::{AudioEncoder, ClientType, ConnectionConfig, MumbleConnection};
 #[cfg(feature = "audio")]
 use tokio::time::{interval, MissedTickBehavior};
 
@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(password) = std::env::var("MUMBLE_PASSWORD") {
         config.password = Some(password);
     }
-    config.client_type = 0;
+    config.client_type = ClientType::Regular;
 
     let mut connection = MumbleConnection::new(config);
     connection.connect().await?;
