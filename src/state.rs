@@ -31,9 +31,9 @@ pub struct ClientState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UdpState {
     /// Symmetric AES key.
-    pub key: Vec<u8>,
+    pub key: [u8; 16],
     /// Client nonce provided by the server.
-    pub client_nonce: Vec<u8>,
+    pub client_nonce: [u8; 16],
     /// Server nonce provided by the server.
-    pub server_nonce: Vec<u8>,
+    pub server_nonce: [u8; 16],
 }

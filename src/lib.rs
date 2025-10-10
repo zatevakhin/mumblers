@@ -23,10 +23,15 @@
 //! ```
 
 pub mod connection;
+pub mod crypto;
 pub mod error;
 pub mod messages;
 pub mod proto;
 pub mod state;
+mod udp;
 
 pub use connection::{ConnectionConfig, ConnectionConfigBuilder, MumbleConnection, MumbleEvent};
+pub use crypto::ocb2::{
+    CryptStateOcb2, DecryptError as OcbDecryptError, EncryptError as OcbEncryptError,
+};
 pub use error::MumbleError;

@@ -24,9 +24,17 @@ use crate::proto::mumble::{
     UserRemove, UserState, Version,
 };
 use crate::state::{ClientState, UdpState};
+use crate::udp::UdpTunnel;
 
 enum ConnectionCommand {
     SendPing,
+}
+
+#[derive(Clone)]
+struct UdpOptions {
+    host: String,
+    port: u16,
+    enable: bool,
 }
 
 /// Events emitted by the connection when new control messages arrive.
@@ -38,6 +46,7 @@ pub enum MumbleEvent {
         message: crate::proto::mumble::Ping,
         round_trip_ms: Option<f64>,
     },
+    UdpPing(crate::proto::mumble_udp::Ping),
     CryptSetup(CryptSetup),
     ChannelState(ChannelState),
     ChannelRemove(ChannelRemove),
@@ -286,16 +295,31 @@ impl MumbleConnection {
                     break;
                 }
                 MumbleMessage::CryptSetup(setup) => {
-                    {
-                        let mut state = self.shared_state.lock().await;
-                        state.udp = Some(UdpState {
-                            key: setup.key.clone().unwrap_or_default(),
-                            client_nonce: setup.client_nonce.clone().unwrap_or_default(),
-                            server_nonce: setup.server_nonce.clone().unwrap_or_default(),
-                        });
-                    }
+                    let params = match (
+                        setup.key.as_ref(),
+                        setup.client_nonce.as_ref(),
+                        setup.server_nonce.as_ref(),
+                    ) {
+                        (Some(key), Some(client), Some(server))
+                            if key.len() == 16 && client.len() == 16 && server.len() == 16 =>
+                        {
+                            let mut state = self.shared_state.lock().await;
+                            let params = UdpState {
+                                key: key.clone().try_into().unwrap(),
+                                client_nonce: client.clone().try_into().unwrap(),
+                                server_nonce: server.clone().try_into().unwrap(),
+                            };
+                            state.udp = Some(params);
+                            drop(state);
+                            Some(())
+                        }
+                        _ => {
+                            tracing::warn!("received malformed CryptSetup message");
+                            None
+                        }
+                    };
                     let _ = self.event_tx.send(MumbleEvent::CryptSetup(setup.clone()));
-                    if self.config.enable_udp {
+                    if params.is_some() && self.config.enable_udp {
                         tracing::debug!("CryptSetup received (UDP enablement pending)");
                     }
                 }
@@ -406,12 +430,18 @@ impl MumbleConnection {
 
         let shared_state = Arc::clone(&self.shared_state);
         let event_tx = self.event_tx.clone();
+        let udp_options = UdpOptions {
+            host: self.config.host.clone(),
+            port: self.config.port,
+            enable: self.config.enable_udp,
+        };
 
         let handle = tokio::spawn(async move {
             connection_loop(
                 stream,
                 shared_state,
                 event_tx,
+                udp_options,
                 DEFAULT_INTERVAL,
                 shutdown_rx,
                 cmd_rx,
@@ -465,11 +495,13 @@ async fn connection_loop(
     mut stream: TlsStream<TcpStream>,
     state: Arc<Mutex<ClientState>>,
     event_tx: broadcast::Sender<MumbleEvent>,
+    udp_options: UdpOptions,
     interval_duration: Duration,
     mut shutdown: watch::Receiver<bool>,
     mut cmd_rx: mpsc::Receiver<ConnectionCommand>,
 ) {
     let mut ticker = interval(interval_duration);
+    let mut udp_tunnel: Option<UdpTunnel> = None;
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -490,7 +522,14 @@ async fn connection_loop(
             result = read_envelope(&mut stream) => {
                 match result {
                     Ok(envelope) => {
-                        handle_inbound_message(envelope, &state, &event_tx).await;
+                        handle_inbound_message(
+                            envelope,
+                            &state,
+                            &event_tx,
+                            &udp_options,
+                            &mut udp_tunnel,
+                        )
+                        .await;
                     }
                     Err(_) => break,
                 }
@@ -528,18 +567,55 @@ async fn handle_inbound_message(
     envelope: MessageEnvelope,
     state: &Arc<Mutex<ClientState>>,
     event_tx: &broadcast::Sender<MumbleEvent>,
+    udp_options: &UdpOptions,
+    udp_tunnel: &mut Option<UdpTunnel>,
 ) {
     match MumbleMessage::try_from(envelope.clone()) {
         Ok(MumbleMessage::CryptSetup(setup)) => {
-            {
-                let mut guard = state.lock().await;
-                guard.udp = Some(UdpState {
-                    key: setup.key.clone().unwrap_or_default(),
-                    client_nonce: setup.client_nonce.clone().unwrap_or_default(),
-                    server_nonce: setup.server_nonce.clone().unwrap_or_default(),
-                });
-            }
+            let params = match (
+                setup.key.as_ref(),
+                setup.client_nonce.as_ref(),
+                setup.server_nonce.as_ref(),
+            ) {
+                (Some(key), Some(client), Some(server))
+                    if key.len() == 16 && client.len() == 16 && server.len() == 16 =>
+                {
+                    let mut guard = state.lock().await;
+                    let params = UdpState {
+                        key: key.clone().try_into().unwrap(),
+                        client_nonce: client.clone().try_into().unwrap(),
+                        server_nonce: server.clone().try_into().unwrap(),
+                    };
+                    guard.udp = Some(params.clone());
+                    drop(guard);
+                    Some(params)
+                }
+                _ => {
+                    tracing::warn!("received malformed CryptSetup message");
+                    None
+                }
+            };
+
             let _ = event_tx.send(MumbleEvent::CryptSetup(setup));
+
+            if udp_options.enable && udp_tunnel.is_none() {
+                if let Some(params) = params {
+                    match UdpTunnel::start(
+                        udp_options.host.clone(),
+                        udp_options.port,
+                        Arc::new(params),
+                        event_tx.clone(),
+                    )
+                    .await
+                    {
+                        Ok(tunnel) => {
+                            tracing::info!("UDP tunnel established");
+                            *udp_tunnel = Some(tunnel);
+                        }
+                        Err(err) => tracing::warn!("failed to start UDP tunnel: {err}"),
+                    }
+                }
+            }
         }
         Ok(MumbleMessage::Ping(ping)) => {
             let round_trip = ping
@@ -679,24 +755,30 @@ mod tests {
         let (event_tx, mut event_rx) = broadcast::channel(4);
 
         let mut crypt = CryptSetup::default();
-        crypt.key = Some(vec![1, 2, 3]);
-        crypt.client_nonce = Some(vec![4, 5, 6]);
-        crypt.server_nonce = Some(vec![7, 8, 9]);
+        crypt.key = Some(vec![1; 16]);
+        crypt.client_nonce = Some(vec![2; 16]);
+        crypt.server_nonce = Some(vec![3; 16]);
         let envelope =
             MessageEnvelope::try_from_message(TcpMessageKind::CryptSetup, &crypt).unwrap();
 
-        handle_inbound_message(envelope, &state, &event_tx).await;
+        let udp_options = UdpOptions {
+            host: "localhost".into(),
+            port: 64738,
+            enable: false,
+        };
+        let mut tunnel = None;
+        handle_inbound_message(envelope, &state, &event_tx, &udp_options, &mut tunnel).await;
 
         let guard = state.lock().await;
         let udp = guard.udp.as_ref().expect("udp state");
-        assert_eq!(udp.key, vec![1, 2, 3]);
-        assert_eq!(udp.client_nonce, vec![4, 5, 6]);
-        assert_eq!(udp.server_nonce, vec![7, 8, 9]);
+        assert_eq!(udp.key, [1; 16]);
+        assert_eq!(udp.client_nonce, [2; 16]);
+        assert_eq!(udp.server_nonce, [3; 16]);
         drop(guard);
 
         match event_rx.recv().await.expect("event message") {
             MumbleEvent::CryptSetup(event) => {
-                assert_eq!(event.key, Some(vec![1, 2, 3]));
+                assert_eq!(event.key.unwrap(), vec![1; 16]);
             }
             other => panic!("unexpected event: {:?}", other),
         }

@@ -1,9 +1,12 @@
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use mumble_rs::{ConnectionConfig, MumbleConnection};
+use mumble_rs::{ConnectionConfig, MumbleConnection, MumbleEvent};
 
-/// Listen for Mumble events and print them to stdout.
+/// Listen for UDP-capable Mumble events and print them to stdout.
+///
+/// Note: Some Murmur deployments delay or suppress the `CryptSetup` control message;
+/// track that open item in the roadmap before relying on UDP output.
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
@@ -29,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(password) = std::env::var("MUMBLE_PASSWORD") {
         config.password = Some(password);
     }
+    config.client_type = 0;
 
     let mut connection = MumbleConnection::new(config);
     connection.connect().await?;
@@ -53,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match tokio::time::timeout(remaining, events.recv()).await {
                 Ok(result) => match result {
-                    Ok(event) => println!("Event: {:?}", event),
+                    Ok(event) => log_event(event),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         println!("Warning: skipped {skipped} events");
                     }
@@ -69,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else {
             match events.recv().await {
-                Ok(event) => println!("Event: {:?}", event),
+                Ok(event) => log_event(event),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     println!("Warning: skipped {skipped} events");
                 }
@@ -82,4 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn log_event(event: MumbleEvent) {
+    match event {
+        MumbleEvent::UdpPing(ping) => println!("Event: UdpPing({ping:?})"),
+        MumbleEvent::CryptSetup(message) => println!("Event: CryptSetup({message:?})"),
+        other => println!("Event: {other:?}"),
+    }
 }

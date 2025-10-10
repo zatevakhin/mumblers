@@ -13,6 +13,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util"
 tokio-rustls = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+aes = "0.8"
+cipher = "0.4"
+rand = "0.8"
 
 [build-dependencies]
 prost-build = "0.14"
