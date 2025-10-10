@@ -20,9 +20,10 @@
         };
       in {
         devShells.default = pkgs.mkShell {
-          buildInputs = [rustToolchain];
+          buildInputs = [rustToolchain pkgs.libopus pkgs.cmake];
 
           shellHook = ''
+            export CMAKE_POLICY_VERSION_MINIMUM=3.5
             export PS1="(env:shell) $PS1"
           '';
         };

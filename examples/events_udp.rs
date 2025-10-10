@@ -91,6 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn log_event(event: MumbleEvent) {
     match event {
         MumbleEvent::UdpPing(ping) => println!("Event: UdpPing({ping:?})"),
+        MumbleEvent::UdpAudio(packet) => println!(
+            "Event: UdpAudio {{ frame: {}, bytes: {} }}",
+            packet.frame_number,
+            packet.opus_data.len()
+        ),
         MumbleEvent::CryptSetup(message) => println!("Event: CryptSetup({message:?})"),
         other => println!("Event: {other:?}"),
     }

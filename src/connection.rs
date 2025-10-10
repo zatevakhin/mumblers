@@ -3,6 +3,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use rand::{rngs::OsRng, RngCore};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
@@ -15,19 +16,30 @@ use tokio_rustls::rustls::{
 };
 use tokio_rustls::{client::TlsStream, TlsConnector};
 
+use crate::audio::VoicePacket;
 use crate::error::MumbleError;
 use crate::messages::{
     read_envelope, MessageDecodeError, MessageEnvelope, MumbleMessage, TcpMessageKind,
 };
 use crate::proto::mumble::{
-    reject::RejectType, Authenticate, ChannelRemove, ChannelState, CryptSetup, TextMessage,
-    UserRemove, UserState, Version,
+    reject::RejectType, Authenticate, ChannelRemove, ChannelState, CodecVersion, CryptSetup,
+    TextMessage, UserRemove, UserState, Version,
 };
 use crate::state::{ClientState, UdpState};
 use crate::udp::UdpTunnel;
 
 enum ConnectionCommand {
     SendPing,
+    SendAudio(VoicePacket),
+}
+
+#[derive(Clone, Debug)]
+enum CryptUpdate {
+    Full(UdpState),
+    Resync {
+        server_nonce: [u8; 16],
+        client_nonce: [u8; 16],
+    },
 }
 
 #[derive(Clone)]
@@ -46,7 +58,12 @@ pub enum MumbleEvent {
         message: crate::proto::mumble::Ping,
         round_trip_ms: Option<f64>,
     },
+    /// Encrypted UDP ping event emitted by the tunnel keepalive loop.
     UdpPing(crate::proto::mumble_udp::Ping),
+    /// Decrypted UDP audio frame delivered by the voice tunnel.
+    UdpAudio(crate::audio::VoicePacket),
+    /// Codec negotiation message indicating server preferences.
+    CodecVersion(CodecVersion),
     CryptSetup(CryptSetup),
     ChannelState(ChannelState),
     ChannelRemove(ChannelRemove),
@@ -255,6 +272,7 @@ impl MumbleConnection {
 
         send_version(&mut tls_stream).await?;
         send_authenticate(&mut tls_stream, &self.config).await?;
+        send_codec_version(&mut tls_stream).await?;
 
         loop {
             let envelope =
@@ -292,6 +310,9 @@ impl MumbleConnection {
                     state.permissions = sync.permissions;
                     drop(state);
                     let _ = self.event_tx.send(MumbleEvent::ServerSync(sync.clone()));
+                    if self.config.enable_udp {
+                        initiate_udp_handshake(&mut tls_stream, &self.shared_state).await?;
+                    }
                     break;
                 }
                 MumbleMessage::CryptSetup(setup) => {
@@ -322,6 +343,9 @@ impl MumbleConnection {
                     if params.is_some() && self.config.enable_udp {
                         tracing::debug!("CryptSetup received (UDP enablement pending)");
                     }
+                }
+                MumbleMessage::CodecVersion(codec) => {
+                    let _ = self.event_tx.send(MumbleEvent::CodecVersion(codec.clone()));
                 }
                 MumbleMessage::Reject(reject) => {
                     let mut reason = reject
@@ -392,6 +416,25 @@ impl MumbleConnection {
             tx.send(ConnectionCommand::SendPing)
                 .await
                 .map_err(|_| MumbleError::ConnectionLost("connection task stopped"))?
+        } else {
+            return Err(MumbleError::InvalidConfig(
+                "connection not established".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Enqueue an Opus frame for delivery over the UDP tunnel.
+    pub async fn send_audio(&self, packet: VoicePacket) -> Result<(), MumbleError> {
+        if !self.config.enable_udp {
+            return Err(MumbleError::InvalidConfig(
+                "UDP support disabled in connection config".into(),
+            ));
+        }
+        if let Some(tx) = &self.command_tx {
+            tx.send(ConnectionCommand::SendAudio(packet))
+                .await
+                .map_err(|_| MumbleError::ConnectionLost("connection task stopped"))?;
         } else {
             return Err(MumbleError::InvalidConfig(
                 "connection not established".into(),
@@ -500,8 +543,32 @@ async fn connection_loop(
     mut shutdown: watch::Receiver<bool>,
     mut cmd_rx: mpsc::Receiver<ConnectionCommand>,
 ) {
-    let mut ticker = interval(interval_duration);
     let mut udp_tunnel: Option<UdpTunnel> = None;
+
+    if udp_options.enable {
+        let initial_params = {
+            let guard = state.lock().await;
+            guard.udp.clone()
+        };
+        if let Some(params) = initial_params {
+            match UdpTunnel::start(
+                udp_options.host.clone(),
+                udp_options.port,
+                Arc::new(params),
+                event_tx.clone(),
+            )
+            .await
+            {
+                Ok(tunnel) => {
+                    tracing::info!("UDP tunnel established");
+                    udp_tunnel = Some(tunnel);
+                }
+                Err(err) => tracing::warn!("failed to start UDP tunnel: {err}"),
+            }
+        }
+    }
+
+    let mut ticker = interval(interval_duration);
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -516,20 +583,34 @@ async fn connection_loop(
                             break;
                         }
                     }
+                    Some(ConnectionCommand::SendAudio(packet)) => {
+                        if let Some(tunnel) = udp_tunnel.as_ref() {
+                            if let Err(err) = tunnel.send_audio(packet).await {
+                                tracing::warn!("failed to send UDP audio: {err}");
+                            }
+                        } else {
+                            tracing::debug!("discarding audio frame: UDP tunnel not yet established");
+                        }
+                    }
                     None => break,
                 }
             }
             result = read_envelope(&mut stream) => {
                 match result {
                     Ok(envelope) => {
-                        handle_inbound_message(
-                            envelope,
-                            &state,
-                            &event_tx,
-                            &udp_options,
-                            &mut udp_tunnel,
-                        )
-                        .await;
+                        if let Some(update) =
+                            handle_inbound_message(envelope.clone(), &state, &event_tx).await
+                        {
+                            handle_crypt_update(
+                                update,
+                                &state,
+                                &event_tx,
+                                &udp_options,
+                                &mut udp_tunnel,
+                                &mut stream,
+                            )
+                            .await;
+                        }
                     }
                     Err(_) => break,
                 }
@@ -567,39 +648,218 @@ async fn handle_inbound_message(
     envelope: MessageEnvelope,
     state: &Arc<Mutex<ClientState>>,
     event_tx: &broadcast::Sender<MumbleEvent>,
-    udp_options: &UdpOptions,
-    udp_tunnel: &mut Option<UdpTunnel>,
-) {
+) -> Option<CryptUpdate> {
     match MumbleMessage::try_from(envelope.clone()) {
         Ok(MumbleMessage::CryptSetup(setup)) => {
-            let params = match (
-                setup.key.as_ref(),
-                setup.client_nonce.as_ref(),
-                setup.server_nonce.as_ref(),
-            ) {
-                (Some(key), Some(client), Some(server))
-                    if key.len() == 16 && client.len() == 16 && server.len() == 16 =>
-                {
-                    let mut guard = state.lock().await;
-                    let params = UdpState {
-                        key: key.clone().try_into().unwrap(),
-                        client_nonce: client.clone().try_into().unwrap(),
-                        server_nonce: server.clone().try_into().unwrap(),
-                    };
-                    guard.udp = Some(params.clone());
-                    drop(guard);
-                    Some(params)
-                }
-                _ => {
-                    tracing::warn!("received malformed CryptSetup message");
-                    None
-                }
+            let action = {
+                let mut guard = state.lock().await;
+                update_udp_state_with_cryptsetup(&mut guard, &setup)
             };
-
             let _ = event_tx.send(MumbleEvent::CryptSetup(setup));
+            action
+        }
+        Ok(MumbleMessage::CodecVersion(message)) => {
+            let _ = event_tx.send(MumbleEvent::CodecVersion(message));
+            None
+        }
+        Ok(MumbleMessage::Ping(ping)) => {
+            let round_trip = ping
+                .timestamp
+                .map(|ts| current_millis().saturating_sub(ts) as f64);
+            {
+                let mut guard = state.lock().await;
+                guard.ping_received += 1;
+                apply_latency_metrics(&mut guard, &ping);
+            }
+            let _ = event_tx.send(MumbleEvent::Ping {
+                message: ping,
+                round_trip_ms: round_trip,
+            });
+            None
+        }
+        Ok(MumbleMessage::ServerSync(sync)) => {
+            {
+                let mut guard = state.lock().await;
+                guard.is_connected = true;
+                guard.session_id = sync.session;
+                guard.max_bandwidth = sync.max_bandwidth;
+                guard.welcome_text = sync.welcome_text.clone();
+                guard.permissions = sync.permissions;
+            }
+            let _ = event_tx.send(MumbleEvent::ServerSync(sync));
+            None
+        }
+        Ok(MumbleMessage::Version(version)) => {
+            let _ = event_tx.send(MumbleEvent::Version(version));
+            None
+        }
+        Ok(MumbleMessage::ChannelState(message)) => {
+            let _ = event_tx.send(MumbleEvent::ChannelState(message));
+            None
+        }
+        Ok(MumbleMessage::ChannelRemove(message)) => {
+            let _ = event_tx.send(MumbleEvent::ChannelRemove(message));
+            None
+        }
+        Ok(MumbleMessage::UserState(message)) => {
+            let _ = event_tx.send(MumbleEvent::UserState(message));
+            None
+        }
+        Ok(MumbleMessage::UserRemove(message)) => {
+            let _ = event_tx.send(MumbleEvent::UserRemove(message));
+            None
+        }
+        Ok(MumbleMessage::TextMessage(message)) => {
+            let _ = event_tx.send(MumbleEvent::TextMessage(message));
+            None
+        }
+        Ok(other) => {
+            let _ = event_tx.send(MumbleEvent::Other(other));
+            None
+        }
+        Err(err) => {
+            tracing::warn!("failed to decode inbound message: {err}");
+            let _ = event_tx.send(MumbleEvent::Unknown(envelope));
+            None
+        }
+    }
+}
 
-            if udp_options.enable && udp_tunnel.is_none() {
-                if let Some(params) = params {
+fn update_udp_state_with_cryptsetup(
+    state: &mut ClientState,
+    setup: &CryptSetup,
+) -> Option<CryptUpdate> {
+    let key = setup.key.as_deref();
+    let client = setup.client_nonce.as_deref();
+    let server = setup.server_nonce.as_deref();
+
+    if let (Some(key), Some(client), Some(server)) = (key, client, server) {
+        if key.len() == 16 && client.len() == 16 && server.len() == 16 {
+            let params = UdpState {
+                key: slice_to_array(key),
+                client_nonce: slice_to_array(client),
+                server_nonce: slice_to_array(server),
+            };
+            state.udp = Some(params.clone());
+            return Some(CryptUpdate::Full(params));
+        }
+    }
+
+    if let Some(server) = server {
+        if server.len() == 16 {
+            if let Some(existing) = state.udp.as_mut() {
+                let server_nonce = slice_to_array(server);
+                existing.server_nonce = server_nonce;
+                return Some(CryptUpdate::Resync {
+                    server_nonce,
+                    client_nonce: existing.client_nonce,
+                });
+            } else {
+                tracing::warn!("received CryptSetup resync without existing UDP state");
+            }
+        }
+    }
+    None
+}
+
+fn slice_to_array(bytes: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out.copy_from_slice(bytes);
+    out
+}
+
+fn generate_udp_state() -> UdpState {
+    let mut key = [0u8; 16];
+    let mut client_nonce = [0u8; 16];
+    OsRng.fill_bytes(&mut key);
+    OsRng.fill_bytes(&mut client_nonce);
+    UdpState {
+        key,
+        client_nonce,
+        server_nonce: [0u8; 16],
+    }
+}
+
+async fn ensure_udp_state(state: &Arc<Mutex<ClientState>>) -> UdpState {
+    let mut guard = state.lock().await;
+    if let Some(existing) = guard.udp.clone() {
+        return existing;
+    }
+    let generated = generate_udp_state();
+    guard.udp = Some(generated.clone());
+    generated
+}
+
+async fn send_udp_state_message(
+    stream: &mut TlsStream<TcpStream>,
+    state: &Arc<Mutex<ClientState>>,
+    include_key: bool,
+    include_client: bool,
+) -> Result<(), MumbleError> {
+    let params = {
+        let guard = state.lock().await;
+        guard.udp.clone()
+    };
+
+    if let Some(params) = params {
+        let mut setup = CryptSetup::default();
+        if include_key {
+            setup.key = Some(params.key.to_vec());
+        }
+        if include_client {
+            setup.client_nonce = Some(params.client_nonce.to_vec());
+        }
+        send_message(stream, TcpMessageKind::CryptSetup, &setup).await?;
+    }
+
+    Ok(())
+}
+
+async fn handle_crypt_update(
+    update: CryptUpdate,
+    state: &Arc<Mutex<ClientState>>,
+    event_tx: &broadcast::Sender<MumbleEvent>,
+    udp_options: &UdpOptions,
+    udp_tunnel: &mut Option<UdpTunnel>,
+    stream: &mut TlsStream<TcpStream>,
+) {
+    if !udp_options.enable {
+        return;
+    }
+
+    match update {
+        CryptUpdate::Full(params) => {
+            let arc_params = Arc::new(params.clone());
+            if let Some(tunnel) = udp_tunnel.as_ref() {
+                if let Err(err) = tunnel.update_key(Arc::clone(&arc_params)).await {
+                    tracing::warn!("failed to update UDP key: {err}");
+                }
+            } else {
+                match UdpTunnel::start(
+                    udp_options.host.clone(),
+                    udp_options.port,
+                    Arc::clone(&arc_params),
+                    event_tx.clone(),
+                )
+                .await
+                {
+                    Ok(tunnel) => {
+                        tracing::info!("UDP tunnel established");
+                        *udp_tunnel = Some(tunnel);
+                    }
+                    Err(err) => tracing::warn!("failed to start UDP tunnel: {err}"),
+                }
+            }
+        }
+        CryptUpdate::Resync {
+            server_nonce,
+            client_nonce,
+        } => {
+            if udp_tunnel.is_none() {
+                if let Some(params) = {
+                    let guard = state.lock().await;
+                    guard.udp.clone()
+                } {
                     match UdpTunnel::start(
                         udp_options.host.clone(),
                         udp_options.port,
@@ -616,56 +876,16 @@ async fn handle_inbound_message(
                     }
                 }
             }
-        }
-        Ok(MumbleMessage::Ping(ping)) => {
-            let round_trip = ping
-                .timestamp
-                .map(|ts| current_millis().saturating_sub(ts) as f64);
-            {
-                let mut guard = state.lock().await;
-                guard.ping_received += 1;
-                apply_latency_metrics(&mut guard, &ping);
+
+            if let Some(tunnel) = udp_tunnel.as_ref() {
+                if let Err(err) = tunnel.resync(server_nonce, client_nonce).await {
+                    tracing::warn!("failed to apply UDP resync: {err}");
+                }
             }
-            let _ = event_tx.send(MumbleEvent::Ping {
-                message: ping,
-                round_trip_ms: round_trip,
-            });
-        }
-        Ok(MumbleMessage::ServerSync(sync)) => {
-            {
-                let mut guard = state.lock().await;
-                guard.is_connected = true;
-                guard.session_id = sync.session;
-                guard.max_bandwidth = sync.max_bandwidth;
-                guard.welcome_text = sync.welcome_text.clone();
-                guard.permissions = sync.permissions;
+
+            if let Err(err) = send_udp_state_message(stream, state, false, true).await {
+                tracing::warn!("failed to acknowledge UDP resync: {err}");
             }
-            let _ = event_tx.send(MumbleEvent::ServerSync(sync));
-        }
-        Ok(MumbleMessage::Version(version)) => {
-            let _ = event_tx.send(MumbleEvent::Version(version));
-        }
-        Ok(MumbleMessage::ChannelState(message)) => {
-            let _ = event_tx.send(MumbleEvent::ChannelState(message));
-        }
-        Ok(MumbleMessage::ChannelRemove(message)) => {
-            let _ = event_tx.send(MumbleEvent::ChannelRemove(message));
-        }
-        Ok(MumbleMessage::UserState(message)) => {
-            let _ = event_tx.send(MumbleEvent::UserState(message));
-        }
-        Ok(MumbleMessage::UserRemove(message)) => {
-            let _ = event_tx.send(MumbleEvent::UserRemove(message));
-        }
-        Ok(MumbleMessage::TextMessage(message)) => {
-            let _ = event_tx.send(MumbleEvent::TextMessage(message));
-        }
-        Ok(other) => {
-            let _ = event_tx.send(MumbleEvent::Other(other));
-        }
-        Err(err) => {
-            tracing::warn!("failed to decode inbound message: {err}");
-            let _ = event_tx.send(MumbleEvent::Unknown(envelope));
         }
     }
 }
@@ -761,13 +981,15 @@ mod tests {
         let envelope =
             MessageEnvelope::try_from_message(TcpMessageKind::CryptSetup, &crypt).unwrap();
 
-        let udp_options = UdpOptions {
-            host: "localhost".into(),
-            port: 64738,
-            enable: false,
-        };
-        let mut tunnel = None;
-        handle_inbound_message(envelope, &state, &event_tx, &udp_options, &mut tunnel).await;
+        let update = handle_inbound_message(envelope, &state, &event_tx).await;
+        match update {
+            Some(CryptUpdate::Full(params)) => {
+                assert_eq!(params.key, [1; 16]);
+                assert_eq!(params.client_nonce, [2; 16]);
+                assert_eq!(params.server_nonce, [3; 16]);
+            }
+            other => panic!("unexpected crypt update: {:?}", other),
+        }
 
         let guard = state.lock().await;
         let udp = guard.udp.as_ref().expect("udp state");
@@ -867,6 +1089,11 @@ async fn send_authenticate(
     send_message(stream, TcpMessageKind::Authenticate, &message).await
 }
 
+async fn send_codec_version(stream: &mut TlsStream<TcpStream>) -> Result<(), MumbleError> {
+    let message = build_codec_version_message();
+    send_message(stream, TcpMessageKind::CodecVersion, &message).await
+}
+
 async fn send_message<M: prost::Message>(
     stream: &mut TlsStream<TcpStream>,
     kind: TcpMessageKind,
@@ -878,6 +1105,14 @@ async fn send_message<M: prost::Message>(
         .write_to(stream)
         .await
         .map_err(MumbleError::Network)
+}
+
+async fn initiate_udp_handshake(
+    stream: &mut TlsStream<TcpStream>,
+    state: &Arc<Mutex<ClientState>>,
+) -> Result<(), MumbleError> {
+    let _ = ensure_udp_state(state).await;
+    send_udp_state_message(stream, state, true, true).await
 }
 
 fn build_version_message() -> Version {
@@ -913,4 +1148,13 @@ fn build_authenticate_message(config: &ConnectionConfig) -> Authenticate {
     auth.opus = Some(true);
     auth.client_type = Some(config.client_type);
     auth
+}
+
+fn build_codec_version_message() -> CodecVersion {
+    let mut codec = CodecVersion::default();
+    codec.alpha = -2147483637;
+    codec.beta = -2147483637;
+    codec.prefer_alpha = false;
+    codec.opus = Some(true);
+    codec
 }

@@ -176,6 +176,17 @@ impl CryptStateOcb2 {
     pub fn decrypt_iv(&self) -> [u8; BLOCK_SIZE] {
         self.decrypt_iv
     }
+
+    pub fn set_encrypt_iv(&mut self, iv: &[u8]) {
+        assert_eq!(iv.len(), BLOCK_SIZE);
+        self.encrypt_iv.copy_from_slice(iv);
+    }
+
+    pub fn set_decrypt_iv(&mut self, iv: &[u8]) {
+        assert_eq!(iv.len(), BLOCK_SIZE);
+        self.decrypt_iv.copy_from_slice(iv);
+        self.decrypt_history = [0; 0x100];
+    }
 }
 
 fn ocb_encrypt(

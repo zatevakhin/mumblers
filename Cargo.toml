@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[features]
+default = []
+audio = ["opus"]
+
 [dependencies]
 bytes = "1"
 prost = "0.14"
@@ -16,6 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 aes = "0.8"
 cipher = "0.4"
 rand = "0.8"
+opus = { version = "0.3", optional = true }
 
 [build-dependencies]
 prost-build = "0.14"
@@ -23,3 +28,12 @@ protoc-bin-vendored = "3.1"
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
+hound = "3"
+
+[[example]]
+name = "play_audio"
+required-features = ["audio"]
+
+[[example]]
+name = "record"
+required-features = ["audio"]
