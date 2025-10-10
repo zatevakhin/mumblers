@@ -1,5 +1,5 @@
 [package]
-name = "mumble-rs"
+name = "mumblers"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -31,9 +31,21 @@ clap = { version = "4", features = ["derive"] }
 hound = "3"
 
 [[example]]
-name = "play_audio"
+name = "playback"
 required-features = ["audio"]
 
 [[example]]
 name = "record"
 required-features = ["audio"]
+
+[[example]]
+name = "connect"
+
+[[example]]
+name = "events_tcp"
+
+[[example]]
+name = "events_udp"
+
+[[example]]
+name = "ping"

@@ -1,20 +1,11 @@
-#![cfg_attr(not(feature = "audio"), allow(dead_code))]
-
-#[cfg(feature = "audio")]
 use std::path::PathBuf;
-#[cfg(feature = "audio")]
 use std::time::Duration;
 
-#[cfg(feature = "audio")]
 use clap::Parser;
-#[cfg(feature = "audio")]
 use hound::WavReader;
-#[cfg(feature = "audio")]
-use mumble_rs::{AudioEncoder, ClientType, ConnectionConfig, MumbleConnection};
-#[cfg(feature = "audio")]
+use mumblers::{AudioEncoder, ClientType, ConnectionConfig, MumbleConnection};
 use tokio::time::{interval, MissedTickBehavior};
 
-#[cfg(feature = "audio")]
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
@@ -26,7 +17,6 @@ struct Args {
     file: PathBuf,
 }
 
-#[cfg(feature = "audio")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -98,7 +88,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "audio")]
 async fn send_frame(
     connection: &MumbleConnection,
     encoder: &mut AudioEncoder,
@@ -107,9 +96,4 @@ async fn send_frame(
     let packet = encoder.encode_frame(samples)?;
     connection.send_audio(packet).await?;
     Ok(())
-}
-
-#[cfg(not(feature = "audio"))]
-fn main() {
-    eprintln!("This example requires building with --features audio");
 }

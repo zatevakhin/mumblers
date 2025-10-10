@@ -1,25 +1,13 @@
-#![cfg_attr(not(feature = "audio"), allow(dead_code))]
-
-#[cfg(feature = "audio")]
 use std::path::PathBuf;
-#[cfg(feature = "audio")]
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "audio")]
 use clap::Parser;
-#[cfg(feature = "audio")]
 use hound::{SampleFormat, WavSpec, WavWriter};
-#[cfg(feature = "audio")]
-use mumble_rs::{
-    ClientType, ConnectionConfig, MumbleConnection, MumbleEvent, ReceivedAudioQueue, VoicePacket,
-};
-#[cfg(feature = "audio")]
+use mumblers::{ClientType, ConnectionConfig, MumbleConnection, MumbleEvent, SoundChunk};
 use tokio::sync::Mutex;
 
-#[cfg(feature = "audio")]
 const SAMPLE_RATE: u32 = 48_000;
 
-#[cfg(feature = "audio")]
 /// Capture UDP audio packets, decode them with Opus, and persist to a WAV file.
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -35,16 +23,12 @@ struct Args {
     output: PathBuf,
 }
 
-#[cfg(feature = "audio")]
 struct Recorder {
-    queue: Mutex<ReceivedAudioQueue>,
     writer: Mutex<WavWriter<std::io::BufWriter<std::fs::File>>>,
 }
 
-#[cfg(feature = "audio")]
 impl Recorder {
     fn new(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
-        let queue = ReceivedAudioQueue::new()?;
         let spec = WavSpec {
             channels: 1,
             sample_rate: SAMPLE_RATE,
@@ -53,62 +37,25 @@ impl Recorder {
         };
         let writer = WavWriter::create(path, spec)?;
         Ok(Self {
-            queue: Mutex::new(queue),
             writer: Mutex::new(writer),
         })
     }
 
-    async fn ingest_packet(&self, packet: &VoicePacket) -> Result<(), Box<dyn std::error::Error>> {
-        {
-            let mut queue = self.queue.lock().await;
-            queue.add(packet)?;
-        }
-        self.flush_ready().await
-    }
-
-    async fn flush_ready(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let ready_chunks = {
-            let mut queue = self.queue.lock().await;
-            let now = Instant::now();
-            let mut ready = Vec::new();
-            while let Some(chunk) = queue.pop_ready(now) {
-                ready.push(chunk);
-            }
-            ready
-        };
-
-        if ready_chunks.is_empty() {
-            return Ok(());
-        }
-
+    async fn write_chunk(
+        &self,
+        session_id: u32,
+        chunk: SoundChunk,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut writer = self.writer.lock().await;
-        for chunk in ready_chunks {
-            for sample in chunk.pcm {
-                writer.write_sample(sample)?;
-            }
+        for sample in &chunk.pcm {
+            writer.write_sample(*sample)?;
         }
-        Ok(())
-    }
-
-    async fn flush_all(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let remaining = {
-            let mut queue = self.queue.lock().await;
-            let mut drained = Vec::new();
-            while let Some(chunk) = queue.pop_front() {
-                drained.push(chunk);
-            }
-            drained
-        };
-        if remaining.is_empty() {
-            return Ok(());
-        }
-
-        let mut writer = self.writer.lock().await;
-        for chunk in remaining {
-            for sample in chunk.pcm {
-                writer.write_sample(sample)?;
-            }
-        }
+        println!(
+            "Captured {} samples from session {} (target {:?})",
+            chunk.pcm.len(),
+            session_id,
+            chunk.header
+        );
         Ok(())
     }
 
@@ -119,7 +66,6 @@ impl Recorder {
     }
 }
 
-#[cfg(feature = "audio")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -140,6 +86,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut connection = MumbleConnection::new(config);
     connection.connect().await?;
+
+    connection
+        .wait_for_udp_ready(Some(Duration::from_secs(5)))
+        .await?;
 
     if let Some(version) = connection.server_version() {
         println!("Connected. Server version: {:?}", version);
@@ -189,7 +139,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    recorder.flush_all().await?;
+    if let Some(playback) = connection.audio_playback() {
+        for (session_id, chunk) in playback.drain_all().await {
+            recorder.write_chunk(session_id, chunk).await?;
+        }
+    }
     recorder.finalize()?;
     println!(
         "Recording complete. Captured audio written to {}",
@@ -198,20 +152,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "audio")]
 async fn handle_event(
     event: MumbleEvent,
     recorder: &Recorder,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match event {
-        MumbleEvent::UdpAudio(packet) => {
-            let frame_number = packet.frame_number;
-            let payload_len = packet.opus_data.len();
-            println!(
-                "Event: UdpAudio {{ frame: {}, bytes: {} }}",
-                frame_number, payload_len
-            );
-            recorder.ingest_packet(&packet).await?;
+        MumbleEvent::AudioChunk { session_id, chunk } => {
+            recorder.write_chunk(session_id, chunk).await?;
+        }
+        MumbleEvent::UdpAudio(_) => {
+            // Raw packets still arrive for logging scenarios.
         }
         MumbleEvent::UdpPing(ping) => {
             println!("Event: UdpPing({ping:?})");
@@ -224,9 +174,4 @@ async fn handle_event(
         }
     }
     Ok(())
-}
-
-#[cfg(not(feature = "audio"))]
-fn main() {
-    eprintln!("This example requires building with --features audio");
 }

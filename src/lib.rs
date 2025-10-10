@@ -6,7 +6,7 @@
 //! ## Example
 //!
 //! ```no_run
-//! use mumble_rs::{ConnectionConfig, MumbleConnection};
+//! use mumblers::{ConnectionConfig, MumbleConnection};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {

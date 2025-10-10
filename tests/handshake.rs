@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use mumble_rs::{ConnectionConfig, MumbleConnection};
+use mumblers::{ConnectionConfig, MumbleConnection};
 
 fn read_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())

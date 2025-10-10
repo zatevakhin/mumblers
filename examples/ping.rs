@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use clap::Parser;
-use mumble_rs::{ConnectionConfig, MumbleConnection};
+use mumblers::{ConnectionConfig, MumbleConnection};
 
 /// Simple CLI to monitor Mumble ping statistics.
 #[derive(Parser, Debug)]

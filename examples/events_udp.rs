@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use mumble_rs::{ClientType, ConnectionConfig, MumbleConnection, MumbleEvent};
+use mumblers::{ClientType, ConnectionConfig, MumbleConnection, MumbleEvent};
 
 /// Listen for UDP-capable Mumble events and print them to stdout.
 ///

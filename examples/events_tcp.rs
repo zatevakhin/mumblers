@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use mumble_rs::{ConnectionConfig, MumbleConnection};
+use mumblers::{ConnectionConfig, MumbleConnection};
 
 /// Listen for Mumble events over the TCP control channel and print them to stdout.
 #[derive(Parser, Debug)]
