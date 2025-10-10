@@ -7,7 +7,7 @@ use rand::{rngs::OsRng, RngCore};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
-use tokio::time::{interval, timeout};
+use tokio::time::{interval, sleep, timeout, Instant as TokioInstant};
 use tokio_rustls::rustls::{
     self,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -345,6 +345,10 @@ impl MumbleConnection {
                     }
                 }
                 MumbleMessage::CodecVersion(codec) => {
+                    {
+                        let mut state = self.shared_state.lock().await;
+                        state.codec_version = Some(codec.clone());
+                    }
                     let _ = self.event_tx.send(MumbleEvent::CodecVersion(codec.clone()));
                 }
                 MumbleMessage::Reject(reject) => {
@@ -405,9 +409,44 @@ impl MumbleConnection {
         self.shared_state.lock().await.clone()
     }
 
+    /// Last codec negotiation preferences announced by the server, if any.
+    pub async fn codec_version(&self) -> Option<crate::proto::mumble::CodecVersion> {
+        self.shared_state.lock().await.codec_version.clone()
+    }
+
     /// Return the most recently received UDP handshake parameters, if any.
     pub async fn udp_state(&self) -> Option<UdpState> {
         self.shared_state.lock().await.udp.clone()
+    }
+
+    /// Block until UDP CryptSetup parameters are available (or timeout elapses).
+    pub async fn wait_for_udp_ready(&self, timeout: Option<Duration>) -> Result<(), MumbleError> {
+        if !self.config.enable_udp {
+            return Err(MumbleError::InvalidConfig(
+                "UDP support disabled in connection config".into(),
+            ));
+        }
+        if self.shared_state.lock().await.udp.is_some() {
+            return Ok(());
+        }
+
+        let check_interval = Duration::from_millis(20);
+        let deadline = timeout.map(|limit| TokioInstant::now() + limit);
+        loop {
+            {
+                if self.shared_state.lock().await.udp.is_some() {
+                    return Ok(());
+                }
+            }
+            if let Some(deadline) = deadline {
+                if TokioInstant::now() >= deadline {
+                    return Err(MumbleError::Timeout(
+                        "timed out waiting for UDP CryptSetup".into(),
+                    ));
+                }
+            }
+            sleep(check_interval).await;
+        }
     }
 
     /// Send a ping message immediately and update latency statistics.
@@ -659,6 +698,10 @@ async fn handle_inbound_message(
             action
         }
         Ok(MumbleMessage::CodecVersion(message)) => {
+            {
+                let mut guard = state.lock().await;
+                guard.codec_version = Some(message.clone());
+            }
             let _ = event_tx.send(MumbleEvent::CodecVersion(message));
             None
         }

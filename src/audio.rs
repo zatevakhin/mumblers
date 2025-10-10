@@ -8,7 +8,11 @@
 use crate::proto::mumble_udp;
 
 #[cfg(feature = "audio")]
+use crate::proto::mumble::CodecVersion;
+#[cfg(feature = "audio")]
 use opus::{Application, Bitrate, Channels, Encoder as OpusEncoder};
+#[cfg(feature = "audio")]
+use std::time::{Duration, Instant};
 #[cfg(feature = "audio")]
 use thiserror::Error;
 
@@ -115,6 +119,14 @@ const AUDIO_FRAME_MS: u32 = 20;
 #[cfg(feature = "audio")]
 const FRAME_SIZE_MONO: usize = (SAMPLE_RATE as usize * AUDIO_FRAME_MS as usize) / 1000;
 #[cfg(feature = "audio")]
+const SEQUENCE_TICK_MS: u64 = 10;
+#[cfg(feature = "audio")]
+const SEQUENCE_RESET_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(feature = "audio")]
+const FRAME_DURATION_DOUBLE: Duration = Duration::from_millis((AUDIO_FRAME_MS as u64) * 2);
+#[cfg(feature = "audio")]
+const FRAME_TICKS: u64 = (AUDIO_FRAME_MS as u64) / SEQUENCE_TICK_MS;
+#[cfg(feature = "audio")]
 const MAX_COMPRESSED_SIZE: usize = 4 * 1024;
 
 /// Stateful Opus encoder that mirrors pymumble's default audio settings.
@@ -122,25 +134,39 @@ const MAX_COMPRESSED_SIZE: usize = 4 * 1024;
 pub struct AudioEncoder {
     encoder: OpusEncoder,
     frame_size: usize,
-    frame_number: u64,
     target: u32,
     positional_data: Option<[f32; 3]>,
     volume_adjustment: Option<f32>,
+    sequence: u64,
+    sequence_start: Option<Instant>,
+    sequence_last: Option<Instant>,
 }
 
 #[cfg(feature = "audio")]
 impl AudioEncoder {
     /// Create a VOIP-mode Opus encoder with mono output and 20 ms frames.
-    pub fn new(target: u32) -> Result<Self, opus::Error> {
+    pub fn new(target: u32) -> Result<Self, AudioEncodeError> {
+        Self::with_codec(target, None)
+    }
+
+    /// Construct an encoder that honours the negotiated codec settings.
+    pub fn with_codec(target: u32, codec: Option<&CodecVersion>) -> Result<Self, AudioEncodeError> {
+        if let Some(codec) = codec {
+            if !codec.opus.unwrap_or_default() {
+                return Err(AudioEncodeError::UnsupportedCodec);
+            }
+        }
         let mut encoder = OpusEncoder::new(SAMPLE_RATE, DEFAULT_CHANNELS, Application::Voip)?;
         encoder.set_bitrate(Bitrate::Auto)?;
         Ok(Self {
             encoder,
             frame_size: FRAME_SIZE_MONO,
-            frame_number: 0,
             target,
             positional_data: None,
             volume_adjustment: None,
+            sequence: 0,
+            sequence_start: None,
+            sequence_last: None,
         })
     }
 
@@ -166,7 +192,9 @@ impl AudioEncoder {
 
     /// Reset the running frame counter (useful when starting a fresh stream).
     pub fn reset_sequence(&mut self) {
-        self.frame_number = 0;
+        self.sequence = 0;
+        self.sequence_start = None;
+        self.sequence_last = None;
     }
 
     /// Encode a PCM frame (16-bit little endian) into a [`VoicePacket`].
@@ -185,18 +213,54 @@ impl AudioEncoder {
         let encoded_bytes = self.encoder.encode(pcm, &mut buffer)?;
         buffer.truncate(encoded_bytes);
 
+        let frame_number = self.next_frame_number();
+
         let packet = VoicePacket {
             header: AudioHeader::Target(self.target),
             sender_session: None,
-            frame_number: self.frame_number,
+            frame_number,
             opus_data: buffer,
             positional_data: self.positional_data,
             volume_adjustment: self.volume_adjustment,
             is_terminator: false,
         };
 
-        self.frame_number = self.frame_number.wrapping_add(1);
         Ok(packet)
+    }
+
+    fn next_frame_number(&mut self) -> u64 {
+        let now = Instant::now();
+
+        match self.sequence_last {
+            None => {
+                self.sequence = 0;
+                self.sequence_start = Some(now);
+                self.sequence_last = Some(now);
+            }
+            Some(last) => {
+                if now.duration_since(last) >= SEQUENCE_RESET_INTERVAL {
+                    self.sequence = 0;
+                    self.sequence_start = Some(now);
+                    self.sequence_last = Some(now);
+                } else if now.duration_since(last) >= FRAME_DURATION_DOUBLE {
+                    let start = self.sequence_start.unwrap_or(now);
+                    let elapsed = now.duration_since(start);
+                    let ticks = (elapsed.as_millis() / SEQUENCE_TICK_MS as u128) as u64;
+                    self.sequence = ticks;
+                    let theoretical =
+                        start + Duration::from_millis(self.sequence * SEQUENCE_TICK_MS);
+                    self.sequence_last = Some(theoretical);
+                } else {
+                    self.sequence = self.sequence.saturating_add(FRAME_TICKS);
+                    let start = self.sequence_start.unwrap_or(now);
+                    let theoretical =
+                        start + Duration::from_millis(self.sequence * SEQUENCE_TICK_MS);
+                    self.sequence_last = Some(theoretical);
+                }
+            }
+        }
+
+        self.sequence
     }
 }
 
@@ -207,6 +271,9 @@ pub enum AudioEncodeError {
     /// Input slice did not match the expected frame size.
     #[error("invalid frame size: expected {expected} samples, got {actual}")]
     InvalidFrameSize { expected: usize, actual: usize },
+    /// Selected codec is not currently supported by the encoder.
+    #[error("codec negotiation requested unsupported encoder")]
+    UnsupportedCodec,
     /// Underlying Opus encoder failure.
     #[error(transparent)]
     Opus(#[from] opus::Error),

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use crate::proto::mumble::CodecVersion;
+
 /// Minimal client-side state captured after connecting.
 #[derive(Clone, Debug, Default)]
 pub struct ClientState {
@@ -23,6 +25,8 @@ pub struct ClientState {
     pub permissions: Option<u64>,
     /// Welcome text presented by the server.
     pub welcome_text: Option<String>,
+    /// Server-provided codec negotiation preferences.
+    pub codec_version: Option<CodecVersion>,
     /// Cryptographic parameters provided via CryptSetup for the UDP tunnel.
     pub udp: Option<UdpState>,
 }

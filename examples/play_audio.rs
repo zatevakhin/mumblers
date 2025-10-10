@@ -10,7 +10,7 @@ use clap::Parser;
 #[cfg(feature = "audio")]
 use hound::WavReader;
 #[cfg(feature = "audio")]
-use mumble_rs::{AudioEncoder, ConnectionConfig, MumbleConnection, MumbleEvent};
+use mumble_rs::{AudioEncoder, ConnectionConfig, MumbleConnection};
 #[cfg(feature = "audio")]
 use tokio::time::sleep;
 
@@ -47,20 +47,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     connection.connect().await?;
 
     println!("Connected. Waiting for UDP CryptSetup…");
-    let mut events = connection.subscribe_events();
-    loop {
-        match events.recv().await {
-            Ok(MumbleEvent::CryptSetup(_)) => {
-                println!("UDP tunnel negotiated, starting playback.");
-                break;
-            }
-            Ok(other) => {
-                println!("Event: {:?}", other);
-            }
-            Err(err) => {
-                return Err(format!("event stream ended before UDP was ready: {err}").into());
-            }
-        }
+    connection
+        .wait_for_udp_ready(Some(Duration::from_secs(5)))
+        .await?;
+    println!("UDP tunnel negotiated, starting playback.");
+
+    let negotiated_codec = connection.codec_version().await;
+    if let Some(codec) = &negotiated_codec {
+        println!("Codec preferences: {:?}", codec);
     }
 
     let mut reader = WavReader::open(&args.file)?;
@@ -75,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("example requires 16-bit PCM WAV input".into());
     }
 
-    let mut encoder = AudioEncoder::new(0)?;
+    let mut encoder = AudioEncoder::with_codec(0, negotiated_codec.as_ref())?;
     let frame_size = encoder.frame_size();
     let mut frame = Vec::with_capacity(frame_size);
 

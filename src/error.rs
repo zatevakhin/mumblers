@@ -19,6 +19,9 @@ pub enum MumbleError {
     /// Server rejected the authentication attempt.
     #[error("server rejected connection: {0}")]
     Rejected(String),
+    /// Operation timed out waiting for a server response.
+    #[error("operation timed out: {0}")]
+    Timeout(String),
     /// The connection dropped unexpectedly while the heartbeat was active.
     #[error("connection lost: {0}")]
     ConnectionLost(&'static str),
