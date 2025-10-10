@@ -7,6 +7,8 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
 
+#[cfg(feature = "audio")]
+use crate::audio::AudioPlaybackManager;
 use crate::audio::VoicePacket;
 use crate::connection::MumbleEvent;
 use crate::crypto::ocb2::{CryptStateOcb2, DecryptError};
@@ -42,6 +44,7 @@ impl UdpTunnel {
         port: u16,
         params: Arc<UdpState>,
         event_tx: tokio::sync::broadcast::Sender<MumbleEvent>,
+        #[cfg(feature = "audio")] playback: Option<Arc<AudioPlaybackManager>>,
     ) -> std::io::Result<Self> {
         let addr: SocketAddr = format!("{}:{}", host, port)
             .parse()
@@ -58,6 +61,8 @@ impl UdpTunnel {
         let (cmd_tx, mut cmd_rx) = mpsc::channel(32);
         let crypt_clone = Arc::clone(&crypt);
         let event_tx_clone = event_tx.clone();
+        #[cfg(feature = "audio")]
+        let playback_clone = playback.clone();
         let task = tokio::spawn(async move {
             let mut ticker = interval(UDP_PING_INTERVAL);
             let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
@@ -77,7 +82,12 @@ impl UdpTunnel {
                                 let packet = &buffer[..len];
                                 match decrypt_packet(&crypt_clone, packet).await {
                                     Ok(plain) => {
-                                        if let Err(err) = handle_plain_packet(&plain, &event_tx_clone) {
+                                        if let Err(err) = handle_plain_packet(
+                                            &plain,
+                                            &event_tx_clone,
+                                            #[cfg(feature = "audio")]
+                                            playback_clone.as_ref(),
+                                        ).await {
                                             tracing::warn!("unable to handle UDP packet: {err}");
                                         }
                                     }
@@ -230,9 +240,10 @@ async fn decrypt_packet(
     guard.decrypt(packet)
 }
 
-fn handle_plain_packet(
+async fn handle_plain_packet(
     plain: &[u8],
     event_tx: &tokio::sync::broadcast::Sender<MumbleEvent>,
+    #[cfg(feature = "audio")] playback: Option<&Arc<AudioPlaybackManager>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if plain.is_empty() {
         return Ok(());
@@ -241,6 +252,12 @@ fn handle_plain_packet(
         MSG_TYPE_AUDIO => {
             let audio = mumble_udp::Audio::decode(&plain[1..])?;
             if let Some(packet) = VoicePacket::from_proto(&audio) {
+                #[cfg(feature = "audio")]
+                if let Some(manager) = playback {
+                    if let Err(err) = manager.ingest(&packet).await {
+                        tracing::warn!("failed to buffer audio packet: {err}");
+                    }
+                }
                 let _ = event_tx.send(MumbleEvent::UdpAudio(packet));
             } else {
                 tracing::debug!("audio packet missing header metadata");

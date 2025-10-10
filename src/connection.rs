@@ -2,6 +2,8 @@ use std::convert::TryFrom;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+#[cfg(feature = "audio")]
+use std::time::Instant;
 
 use rand::{rngs::OsRng, RngCore};
 use tokio::net::TcpStream;
@@ -16,6 +18,8 @@ use tokio_rustls::rustls::{
 };
 use tokio_rustls::{client::TlsStream, TlsConnector};
 
+#[cfg(feature = "audio")]
+use crate::audio::AudioPlaybackManager;
 use crate::audio::VoicePacket;
 use crate::error::MumbleError;
 use crate::messages::{
@@ -62,6 +66,12 @@ pub enum MumbleEvent {
     UdpPing(crate::proto::mumble_udp::Ping),
     /// Decrypted UDP audio frame delivered by the voice tunnel.
     UdpAudio(crate::audio::VoicePacket),
+    #[cfg(feature = "audio")]
+    /// Jitter-buffered PCM chunk ready for playback.
+    AudioChunk {
+        session_id: u32,
+        chunk: crate::audio::SoundChunk,
+    },
     /// Codec negotiation message indicating server preferences.
     CodecVersion(CodecVersion),
     CryptSetup(CryptSetup),
@@ -218,12 +228,19 @@ pub struct MumbleConnection {
     shutdown_tx: Option<watch::Sender<bool>>,
     connection_task: Option<JoinHandle<()>>,
     event_tx: broadcast::Sender<MumbleEvent>,
+    #[cfg(feature = "audio")]
+    audio_playback: Option<Arc<AudioPlaybackManager>>,
+    #[cfg(feature = "audio")]
+    audio_task: Option<JoinHandle<()>>,
 }
 
 impl MumbleConnection {
     /// Create a connection handle with the provided configuration.
     pub fn new(config: ConnectionConfig) -> Self {
         let state = ClientState::default();
+        let (event_tx, _event_rx) = broadcast::channel(32);
+        #[cfg(feature = "audio")]
+        let playback = Some(Arc::new(AudioPlaybackManager::new()));
         Self {
             config,
             server_version: None,
@@ -231,7 +248,11 @@ impl MumbleConnection {
             command_tx: None,
             shutdown_tx: None,
             connection_task: None,
-            event_tx: broadcast::channel(32).0,
+            event_tx,
+            #[cfg(feature = "audio")]
+            audio_playback: playback,
+            #[cfg(feature = "audio")]
+            audio_task: None,
         }
     }
 
@@ -414,6 +435,12 @@ impl MumbleConnection {
         self.shared_state.lock().await.codec_version.clone()
     }
 
+    /// Access the shared playback manager that buffers incoming voice audio.
+    #[cfg(feature = "audio")]
+    pub fn audio_playback(&self) -> Option<Arc<AudioPlaybackManager>> {
+        self.audio_playback.clone()
+    }
+
     /// Return the most recently received UDP handshake parameters, if any.
     pub async fn udp_state(&self) -> Option<UdpState> {
         self.shared_state.lock().await.udp.clone()
@@ -518,6 +545,53 @@ impl MumbleConnection {
             enable: self.config.enable_udp,
         };
 
+        #[cfg(feature = "audio")]
+        let playback = if self.config.enable_udp {
+            self.audio_playback.clone()
+        } else {
+            None
+        };
+
+        #[cfg(feature = "audio")]
+        let mut audio_flush_handle: Option<JoinHandle<()>> = None;
+
+        #[cfg(feature = "audio")]
+        if let Some(manager) = playback.as_ref() {
+            let manager = Arc::clone(manager);
+            let mut flush_shutdown = shutdown_rx.clone();
+            let event_tx_clone = event_tx.clone();
+            audio_flush_handle = Some(tokio::spawn(async move {
+                let mut ticker = interval(Duration::from_millis(10));
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {
+                            let ready = manager.drain_ready(Instant::now()).await;
+                            for (session_id, chunk) in ready {
+                                let _ = event_tx_clone.send(MumbleEvent::AudioChunk { session_id, chunk });
+                            }
+                        }
+                        changed = flush_shutdown.changed() => {
+                            if changed.is_ok() && *flush_shutdown.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let remaining = manager.drain_all().await;
+                for (session_id, chunk) in remaining {
+                    let _ = event_tx_clone.send(MumbleEvent::AudioChunk { session_id, chunk });
+                }
+            }));
+        }
+
+        #[cfg(feature = "audio")]
+        {
+            if let Some(handle) = self.audio_task.take() {
+                handle.abort();
+            }
+            self.audio_task = audio_flush_handle;
+        }
+
         let handle = tokio::spawn(async move {
             connection_loop(
                 stream,
@@ -527,6 +601,8 @@ impl MumbleConnection {
                 DEFAULT_INTERVAL,
                 shutdown_rx,
                 cmd_rx,
+                #[cfg(feature = "audio")]
+                playback,
             )
             .await;
         });
@@ -544,6 +620,10 @@ impl Drop for MumbleConnection {
             let _ = tx.send(true);
         }
         if let Some(handle) = self.connection_task.take() {
+            handle.abort();
+        }
+        #[cfg(feature = "audio")]
+        if let Some(handle) = self.audio_task.take() {
             handle.abort();
         }
     }
@@ -581,6 +661,7 @@ async fn connection_loop(
     interval_duration: Duration,
     mut shutdown: watch::Receiver<bool>,
     mut cmd_rx: mpsc::Receiver<ConnectionCommand>,
+    #[cfg(feature = "audio")] playback: Option<Arc<AudioPlaybackManager>>,
 ) {
     let mut udp_tunnel: Option<UdpTunnel> = None;
 
@@ -595,6 +676,8 @@ async fn connection_loop(
                 udp_options.port,
                 Arc::new(params),
                 event_tx.clone(),
+                #[cfg(feature = "audio")]
+                playback.clone(),
             )
             .await
             {
@@ -647,6 +730,8 @@ async fn connection_loop(
                                 &udp_options,
                                 &mut udp_tunnel,
                                 &mut stream,
+                                #[cfg(feature = "audio")]
+                                playback.clone(),
                             )
                             .await;
                         }
@@ -865,6 +950,7 @@ async fn handle_crypt_update(
     udp_options: &UdpOptions,
     udp_tunnel: &mut Option<UdpTunnel>,
     stream: &mut TlsStream<TcpStream>,
+    #[cfg(feature = "audio")] playback: Option<Arc<AudioPlaybackManager>>,
 ) {
     if !udp_options.enable {
         return;
@@ -883,6 +969,8 @@ async fn handle_crypt_update(
                     udp_options.port,
                     Arc::clone(&arc_params),
                     event_tx.clone(),
+                    #[cfg(feature = "audio")]
+                    playback.clone(),
                 )
                 .await
                 {
@@ -908,6 +996,8 @@ async fn handle_crypt_update(
                         udp_options.port,
                         Arc::new(params),
                         event_tx.clone(),
+                        #[cfg(feature = "audio")]
+                        playback.clone(),
                     )
                     .await
                     {

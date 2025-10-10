@@ -32,7 +32,10 @@ pub mod state;
 mod udp;
 
 #[cfg(feature = "audio")]
-pub use audio::{AudioDecodeError, AudioEncodeError, AudioEncoder, ReceivedAudioQueue, SoundChunk};
+pub use audio::{
+    AudioDecodeError, AudioEncodeError, AudioEncoder, AudioPlaybackManager, ReceivedAudioQueue,
+    SoundChunk,
+};
 pub use audio::{AudioHeader, VoicePacket};
 pub use connection::{ConnectionConfig, ConnectionConfigBuilder, MumbleConnection, MumbleEvent};
 pub use crypto::ocb2::{

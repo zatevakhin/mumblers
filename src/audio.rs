@@ -12,11 +12,13 @@ use crate::proto::mumble::CodecVersion;
 #[cfg(feature = "audio")]
 use opus::{Application, Bitrate, Channels, Decoder as OpusDecoder, Encoder as OpusEncoder};
 #[cfg(feature = "audio")]
-use std::collections::VecDeque;
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 #[cfg(feature = "audio")]
 use std::time::{Duration, Instant};
 #[cfg(feature = "audio")]
 use thiserror::Error;
+#[cfg(feature = "audio")]
+use tokio::sync::Mutex;
 
 /// Identifies how the recipient should interpret the audio payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,6 +482,71 @@ impl ReceivedAudioQueue {
         match position {
             Some(index) => self.queue.insert(index, chunk),
             None => self.queue.push_back(chunk),
+        }
+    }
+}
+
+/// Shared jitter buffer manager coordinating playback per remote session.
+#[cfg(feature = "audio")]
+#[derive(Default)]
+pub struct AudioPlaybackManager {
+    queues: Mutex<HashMap<u32, ReceivedAudioQueue>>,
+}
+
+#[cfg(feature = "audio")]
+impl AudioPlaybackManager {
+    /// Construct a new playback manager.
+    pub fn new() -> Self {
+        Self {
+            queues: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Decode and enqueue an inbound voice packet for the associated session.
+    pub async fn ingest(&self, packet: &VoicePacket) -> Result<(), AudioDecodeError> {
+        let session = packet.sender_session.unwrap_or(0);
+        let mut guard = self.queues.lock().await;
+        let queue = match guard.entry(session) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(ReceivedAudioQueue::new()?),
+        };
+        queue.add(packet)?;
+        Ok(())
+    }
+
+    /// Retrieve all chunks whose scheduled playout time has elapsed.
+    pub async fn drain_ready(&self, now: Instant) -> Vec<(u32, SoundChunk)> {
+        let mut guard = self.queues.lock().await;
+        let mut ready = Vec::new();
+        for (&session, queue) in guard.iter_mut() {
+            while let Some(chunk) = queue.pop_ready(now) {
+                ready.push((session, chunk));
+            }
+        }
+        ready
+    }
+
+    /// Flush all buffered audio, irrespective of target time.
+    pub async fn drain_all(&self) -> Vec<(u32, SoundChunk)> {
+        let mut guard = self.queues.lock().await;
+        let mut ready = Vec::new();
+        for (&session, queue) in guard.iter_mut() {
+            while let Some(chunk) = queue.pop_front() {
+                ready.push((session, chunk));
+            }
+        }
+        ready
+    }
+
+    /// Toggle whether audio should be buffered for a specific session.
+    pub async fn set_receive_sound(&self, session: u32, enabled: bool) {
+        let mut guard = self.queues.lock().await;
+        if let Some(queue) = guard.get_mut(&session) {
+            queue.set_receive_sound(enabled);
+        } else if enabled {
+            if let Ok(queue) = ReceivedAudioQueue::new() {
+                guard.insert(session, queue);
+            }
         }
     }
 }
