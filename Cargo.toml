@@ -29,6 +29,9 @@ protoc-bin-vendored = "3.1"
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
 hound = "3"
+rcgen = "0.12"
+tokio-rustls = "0.25"
+rustls = "0.23"
 
 [[example]]
 name = "playback"
