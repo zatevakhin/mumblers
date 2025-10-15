@@ -25,5 +25,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Welcome text: {welcome}");
     }
 
+    println!("Channels:");
+    let channels = state.channels.lock().await;
+    for (id, channel) in channels.iter() {
+        println!("  Channel {}: {:?}", id, channel.name);
+    }
+
     Ok(())
 }

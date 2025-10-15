@@ -28,4 +28,7 @@ pub enum MumbleError {
     /// Placeholder for functionality that remains to be implemented.
     #[error("unimplemented: {0}")]
     Unimplemented(&'static str),
+    /// Channel operation failed.
+    #[error("channel error: {0}")]
+    Channel(String),
 }

@@ -110,18 +110,55 @@ impl MockMumbleServer {
                              .unwrap();
                              envelope.write_to(&mut writer).await.unwrap();
 
-                             // Send simulated text message
-                             let text_message = TextMessage {
-                                 actor: Some(1),
-                                 message: "Hello from simulated server!".to_string(),
-                                 ..Default::default()
-                             };
-                             let envelope = MessageEnvelope::try_from_message(
-                                 TcpMessageKind::TextMessage,
-                                 &text_message,
-                             )
-                             .unwrap();
-                             envelope.write_to(&mut writer).await.unwrap();
+                              // Send simulated text message
+                              let text_message = TextMessage {
+                                  actor: Some(1),
+                                  message: "Hello from simulated server!".to_string(),
+                                  ..Default::default()
+                              };
+                              let envelope = MessageEnvelope::try_from_message(
+                                  TcpMessageKind::TextMessage,
+                                  &text_message,
+                              )
+                              .unwrap();
+                              envelope.write_to(&mut writer).await.unwrap();
+
+                              // Send simulated channel remove
+                              let channel_remove = mumblers::proto::mumble::ChannelRemove {
+                                  channel_id: 999, // Non-existent channel
+                              };
+                              let envelope = MessageEnvelope::try_from_message(
+                                  TcpMessageKind::ChannelRemove,
+                                  &channel_remove,
+                              )
+                              .unwrap();
+                              envelope.write_to(&mut writer).await.unwrap();
+
+                              // Send simulated user state for move
+                              let user_state_move = UserState {
+                                  session: Some(1),
+                                  channel_id: Some(1), // Move to channel 1
+                                  ..Default::default()
+                              };
+                              let envelope = MessageEnvelope::try_from_message(
+                                  TcpMessageKind::UserState,
+                                  &user_state_move,
+                              )
+                              .unwrap();
+                              envelope.write_to(&mut writer).await.unwrap();
+
+                              // Send simulated permission denied
+                              let permission_denied = mumblers::proto::mumble::PermissionDenied {
+                                  permission: Some(1),
+                                  channel_id: Some(1),
+                                  ..Default::default()
+                              };
+                              let envelope = MessageEnvelope::try_from_message(
+                                  TcpMessageKind::PermissionDenied,
+                                  &permission_denied,
+                              )
+                              .unwrap();
+                              envelope.write_to(&mut writer).await.unwrap();
                         });
                     }
                 }
@@ -237,4 +274,48 @@ async fn test_event_stream_channel_user_text() {
     } else {
         panic!("Expected MumbleEvent::TextMessage, got {:?}", event);
     }
+
+    // Receive ChannelRemove event
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let MumbleEvent::ChannelRemove(channel_remove) = event {
+        assert_eq!(channel_remove.channel_id, 999);
+    } else {
+        panic!("Expected MumbleEvent::ChannelRemove, got {:?}", event);
+    }
+
+    // Receive UserState event for move
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let MumbleEvent::UserState(user_state) = event {
+        assert_eq!(user_state.session, Some(1));
+        assert_eq!(user_state.channel_id, Some(1));
+    } else {
+        panic!("Expected MumbleEvent::UserState, got {:?}", event);
+    }
+
+    // Receive PermissionDenied event
+    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let MumbleEvent::PermissionDenied(permission_denied) = event {
+        assert_eq!(permission_denied.permission, Some(1));
+        assert_eq!(permission_denied.channel_id, Some(1));
+    } else {
+        panic!("Expected MumbleEvent::PermissionDenied, got {:?}", event);
+    }
+
+    // Verify channel manager state
+    let state = connection.state().await;
+    let channels = state.channels.lock().await;
+    assert!(channels.get(0).is_some()); // Root channel
+    assert!(channels.get(999).is_none()); // Removed channel
+
+    // Verify user channels
+    assert_eq!(state.user_channels.get(&1), Some(&1)); // User moved to channel 1
 }

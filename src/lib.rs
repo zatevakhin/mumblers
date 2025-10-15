@@ -23,6 +23,7 @@
 //! ```
 
 pub mod audio;
+pub mod channels;
 pub mod connection;
 pub mod crypto;
 pub mod error;
@@ -37,6 +38,7 @@ pub use audio::{
     SoundChunk,
 };
 pub use audio::{AudioHeader, VoicePacket};
+pub use channels::{Channel, Channels, SharedChannels};
 pub use connection::{
     ClientType, ConnectionConfig, ConnectionConfigBuilder, MumbleConnection, MumbleEvent,
 };

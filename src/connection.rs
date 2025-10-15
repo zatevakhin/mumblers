@@ -27,7 +27,7 @@ use crate::messages::{
 };
 use crate::proto::mumble::{
     reject::RejectType, Authenticate, ChannelRemove, ChannelState, CodecVersion, CryptSetup,
-    TextMessage, UserRemove, UserState, Version,
+    PermissionDenied, TextMessage, UserRemove, UserState, Version,
 };
 use crate::state::{ClientState, UdpState};
 use crate::udp::UdpTunnel;
@@ -35,6 +35,7 @@ use crate::udp::UdpTunnel;
 enum ConnectionCommand {
     SendPing,
     SendAudio(VoicePacket),
+    SendMessage(MumbleMessage),
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +81,7 @@ pub enum MumbleEvent {
     UserState(UserState),
     UserRemove(UserRemove),
     TextMessage(TextMessage),
+    PermissionDenied(PermissionDenied),
     Other(MumbleMessage),
     Unknown(MessageEnvelope),
 }
@@ -415,12 +417,34 @@ impl MumbleConnection {
                     return Err(MumbleError::Rejected(reason));
                 }
                 MumbleMessage::ChannelState(message) => {
+                    {
+                        let state = self.shared_state.lock().await;
+                        state.channels.lock().await.update(&message);
+                    }
                     let _ = self.event_tx.send(MumbleEvent::ChannelState(message));
                 }
                 MumbleMessage::ChannelRemove(message) => {
+                    {
+                        let state = self.shared_state.lock().await;
+                        let channel_id = message.channel_id;
+                        if channel_id != 0 {
+                            state.channels.lock().await.remove(channel_id);
+                        }
+                    }
                     let _ = self.event_tx.send(MumbleEvent::ChannelRemove(message));
                 }
                 MumbleMessage::UserState(message) => {
+                    {
+                        let mut state = self.shared_state.lock().await;
+                        if let Some(session) = message.session {
+                            if let Some(name) = &message.name {
+                                state.users.insert(session, name.clone());
+                            }
+                            if let Some(channel_id) = message.channel_id {
+                                state.user_channels.insert(session, channel_id);
+                            }
+                        }
+                    }
                     let _ = self.event_tx.send(MumbleEvent::UserState(message));
                 }
                 MumbleMessage::UserRemove(message) => {
@@ -428,6 +452,9 @@ impl MumbleConnection {
                 }
                 MumbleMessage::TextMessage(message) => {
                     let _ = self.event_tx.send(MumbleEvent::TextMessage(message));
+                }
+                MumbleMessage::PermissionDenied(message) => {
+                    let _ = self.event_tx.send(MumbleEvent::PermissionDenied(message));
                 }
                 MumbleMessage::Authenticate(_)
                 | MumbleMessage::Ping(_)
@@ -444,6 +471,35 @@ impl MumbleConnection {
     /// Return the connection configuration.
     pub fn config(&self) -> &ConnectionConfig {
         &self.config
+    }
+
+    /// Send a message to the server.
+    pub async fn send_message(
+        &self,
+        message: crate::messages::MumbleMessage,
+    ) -> Result<(), MumbleError> {
+        if let Some(tx) = &self.command_tx {
+            tx.send(ConnectionCommand::SendMessage(message))
+                .await
+                .map_err(|_| MumbleError::ConnectionLost("failed to send command"))?;
+            Ok(())
+        } else {
+            Err(MumbleError::ConnectionLost("not connected"))
+        }
+    }
+
+    /// Join a channel by sending a UserState message.
+    pub async fn join_channel(&self, channel_id: u32) -> Result<(), MumbleError> {
+        let state = self.shared_state.lock().await;
+        let user_state = state.channels.lock().await.move_user_to_channel(
+            state
+                .session_id
+                .ok_or(MumbleError::Channel("not authenticated".to_string()))?,
+            channel_id,
+        );
+        drop(state);
+        self.send_message(crate::messages::MumbleMessage::UserState(user_state))
+            .await
     }
 
     /// Version message received from the server during connection setup.
@@ -736,15 +792,20 @@ async fn connection_loop(
                             break;
                         }
                     }
-                    Some(ConnectionCommand::SendAudio(packet)) => {
-                        if let Some(tunnel) = udp_tunnel.as_ref() {
-                            if let Err(err) = tunnel.send_audio(packet).await {
-                                tracing::warn!("failed to send UDP audio: {err}");
-                            }
-                        } else {
-                            tracing::debug!("discarding audio frame: UDP tunnel not yet established");
-                        }
-                    }
+                     Some(ConnectionCommand::SendAudio(packet)) => {
+                         if let Some(tunnel) = udp_tunnel.as_ref() {
+                             if let Err(err) = tunnel.send_audio(packet).await {
+                                 tracing::warn!("failed to send UDP audio: {err}");
+                             }
+                         } else {
+                             tracing::debug!("discarding audio frame: UDP tunnel not yet established");
+                         }
+                     }
+                     Some(ConnectionCommand::SendMessage(message)) => {
+                         if let Err(err) = crate::messages::write_message(&mut stream, &message).await {
+                             tracing::warn!("failed to send message: {err}");
+                         }
+                     }
                     None => break,
                 }
             }

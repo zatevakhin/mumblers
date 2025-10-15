@@ -3,8 +3,8 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proto::mumble::{
-    Authenticate, ChannelRemove, ChannelState, CodecVersion, CryptSetup, Ping, Reject, ServerSync,
-    TextMessage, UserRemove, UserState, Version,
+    Authenticate, ChannelRemove, ChannelState, CodecVersion, CryptSetup, PermissionDenied, Ping,
+    Reject, ServerSync, TextMessage, UserRemove, UserState, Version,
 };
 
 /// Protocol revision tuple (major, minor, patch) advertised to the server.
@@ -35,6 +35,8 @@ pub enum TcpMessageKind {
     UserState,
     /// Text message.
     TextMessage,
+    /// Permission denied response.
+    PermissionDenied,
     /// Codec version negotiation.
     CodecVersion,
     /// Any message that does not yet have an explicit mapping.
@@ -55,6 +57,7 @@ impl TcpMessageKind {
             8 => TcpMessageKind::UserRemove,
             9 => TcpMessageKind::UserState,
             11 => TcpMessageKind::TextMessage,
+            12 => TcpMessageKind::PermissionDenied,
             21 => TcpMessageKind::CodecVersion,
             15 => TcpMessageKind::CryptSetup,
             other => TcpMessageKind::Unknown(other),
@@ -74,6 +77,7 @@ impl TcpMessageKind {
             TcpMessageKind::UserRemove => 8,
             TcpMessageKind::UserState => 9,
             TcpMessageKind::TextMessage => 11,
+            TcpMessageKind::PermissionDenied => 12,
             TcpMessageKind::CodecVersion => 21,
             TcpMessageKind::CryptSetup => 15,
             TcpMessageKind::Unknown(value) => value,
@@ -176,6 +180,7 @@ pub enum MumbleMessage {
     UserRemove(UserRemove),
     UserState(UserState),
     TextMessage(TextMessage),
+    PermissionDenied(crate::proto::mumble::PermissionDenied),
     CodecVersion(CodecVersion),
     /// Message type not yet modeled by this enum.
     Unknown(MessageEnvelope),
@@ -195,6 +200,7 @@ impl MumbleMessage {
             MumbleMessage::UserRemove(_) => TcpMessageKind::UserRemove,
             MumbleMessage::UserState(_) => TcpMessageKind::UserState,
             MumbleMessage::TextMessage(_) => TcpMessageKind::TextMessage,
+            MumbleMessage::PermissionDenied(_) => TcpMessageKind::PermissionDenied,
             MumbleMessage::CryptSetup(_) => TcpMessageKind::CryptSetup,
             MumbleMessage::CodecVersion(_) => TcpMessageKind::CodecVersion,
             MumbleMessage::Unknown(envelope) => envelope.kind,
@@ -217,6 +223,9 @@ impl MumbleMessage {
             MumbleMessage::UserRemove(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
             MumbleMessage::UserState(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
             MumbleMessage::TextMessage(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
+            MumbleMessage::PermissionDenied(msg) => {
+                MessageEnvelope::try_from_message(self.kind(), msg)
+            }
             MumbleMessage::CodecVersion(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
             MumbleMessage::Unknown(envelope) => Ok(envelope.clone()),
         }
@@ -314,6 +323,14 @@ impl TryFrom<MessageEnvelope> for MumbleMessage {
                     kind: TcpMessageKind::TextMessage,
                     source,
                 })?,
+            TcpMessageKind::PermissionDenied => {
+                PermissionDenied::decode(envelope.payload.as_slice())
+                    .map(MumbleMessage::PermissionDenied)
+                    .map_err(|source| MessageDecodeError::Decode {
+                        kind: TcpMessageKind::PermissionDenied,
+                        source,
+                    })?
+            }
             TcpMessageKind::Unknown(_) => MumbleMessage::Unknown(envelope),
         };
         Ok(result)
