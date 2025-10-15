@@ -437,12 +437,30 @@ impl MumbleConnection {
                     {
                         let mut state = self.shared_state.lock().await;
                         if let Some(session) = message.session {
-                            if let Some(name) = &message.name {
-                                state.users.insert(session, name.clone());
+                            match (&message.name, message.channel_id) {
+                                (Some(name), Some(channel_id)) => {
+                                    tracing::debug!(session, channel_id, user=%name, "UserState: name+channel");
+                                    state.users.insert(session, name.clone());
+                                    state.user_channels.insert(session, channel_id);
+                                }
+                                (Some(name), None) => {
+                                    tracing::debug!(session, user=%name, "UserState: name only");
+                                    state.users.insert(session, name.clone());
+                                    // Heuristic: some servers omit channel_id for users in root.
+                                    // If we don't yet have a mapping for this session, assume root (0).
+                                    state.user_channels.entry(session).or_insert(0);
+                                }
+                                (None, Some(channel_id)) => {
+                                    let existing = state.users.get(&session).cloned();
+                                    tracing::debug!(session, channel_id, known_user=?existing, "UserState: channel only");
+                                    state.user_channels.insert(session, channel_id);
+                                }
+                                (None, None) => {
+                                    tracing::debug!(session, "UserState: no name/channel");
+                                }
                             }
-                            if let Some(channel_id) = message.channel_id {
-                                state.user_channels.insert(session, channel_id);
-                            }
+                        } else {
+                            tracing::debug!("UserState without session; ignoring");
                         }
                     }
                     let _ = self.event_tx.send(MumbleEvent::UserState(message));
@@ -488,19 +506,94 @@ impl MumbleConnection {
         }
     }
 
-    /// Join a channel by sending a UserState message.
-    pub async fn join_channel(&self, channel_id: u32) -> Result<(), MumbleError> {
-        let state = self.shared_state.lock().await;
-        let user_state = state.channels.lock().await.move_user_to_channel(
-            state
-                .session_id
-                .ok_or(MumbleError::Channel("not authenticated".to_string()))?,
-            channel_id,
-        );
-        drop(state);
-        self.send_message(crate::messages::MumbleMessage::UserState(user_state))
-            .await
-    }
+     /// Join a channel by sending a UserState message.
+     pub async fn join_channel(&self, channel_id: u32) -> Result<(), MumbleError> {
+         let state = self.shared_state.lock().await;
+         let user_state = state.channels.lock().await.move_user_to_channel(
+             state
+                 .session_id
+                 .ok_or(MumbleError::Channel("not authenticated".to_string()))?,
+             channel_id,
+         );
+         drop(state);
+         self.send_message(crate::messages::MumbleMessage::UserState(user_state))
+             .await
+     }
+
+     /// Send a text message to a channel.
+     pub async fn send_channel_message(&self, channel_id: u32, message: String) -> Result<(), MumbleError> {
+         let state = self.shared_state.lock().await;
+         let text_message = state.channels.lock().await.send_channel_message(channel_id, message);
+         drop(state);
+         self.send_message(crate::messages::MumbleMessage::TextMessage(text_message))
+             .await
+     }
+
+     /// Send a private text message to a user.
+     pub async fn send_private_message(&self, session_id: u32, message: String) -> Result<(), MumbleError> {
+         let text_message = TextMessage {
+             session: vec![session_id],
+             message,
+             ..Default::default()
+         };
+         self.send_message(crate::messages::MumbleMessage::TextMessage(text_message))
+             .await
+     }
+
+     /// Mute a user by sending a UserState message.
+     pub async fn mute_user(&self, session_id: u32) -> Result<(), MumbleError> {
+         let user_state = UserState {
+             session: Some(session_id),
+             mute: Some(true),
+             ..Default::default()
+         };
+         self.send_message(crate::messages::MumbleMessage::UserState(user_state))
+             .await
+     }
+
+     /// Unmute a user by sending a UserState message.
+     pub async fn unmute_user(&self, session_id: u32) -> Result<(), MumbleError> {
+         let user_state = UserState {
+             session: Some(session_id),
+             mute: Some(false),
+             ..Default::default()
+         };
+         self.send_message(crate::messages::MumbleMessage::UserState(user_state))
+             .await
+     }
+
+     /// Deafen a user by sending a UserState message.
+     pub async fn deafen_user(&self, session_id: u32) -> Result<(), MumbleError> {
+         let user_state = UserState {
+             session: Some(session_id),
+             deaf: Some(true),
+             ..Default::default()
+         };
+         self.send_message(crate::messages::MumbleMessage::UserState(user_state))
+             .await
+     }
+
+     /// Undeafen a user by sending a UserState message.
+     pub async fn undeafen_user(&self, session_id: u32) -> Result<(), MumbleError> {
+         let user_state = UserState {
+             session: Some(session_id),
+             deaf: Some(false),
+             ..Default::default()
+         };
+         self.send_message(crate::messages::MumbleMessage::UserState(user_state))
+             .await
+     }
+
+     /// Move a user to a different channel by sending a UserState message.
+     pub async fn move_user_to_channel(&self, session_id: u32, channel_id: u32) -> Result<(), MumbleError> {
+         let user_state = UserState {
+             session: Some(session_id),
+             channel_id: Some(channel_id),
+             ..Default::default()
+         };
+         self.send_message(crate::messages::MumbleMessage::UserState(user_state))
+             .await
+     }
 
     /// Version message received from the server during connection setup.
     pub fn server_version(&self) -> Option<&Version> {
@@ -608,10 +701,87 @@ impl MumbleConnection {
         let _ = self.event_tx.send(MumbleEvent::Ping {
             message: ping,
             round_trip_ms: round_trip,
-        });
-    }
+         });
+     }
 
-    async fn spawn_connection_task(
+     /// Join a channel by name by resolving the name to an ID.
+     pub async fn join_channel_by_name(&self, channel_name: &str) -> Result<(), MumbleError> {
+         let state = self.shared_state.lock().await;
+         let channel_id = state.channels.lock().await.find_by_name(channel_name)
+             .ok_or(MumbleError::Channel(format!("channel '{}' not found", channel_name)))?
+             .channel_id;
+         drop(state);
+         self.join_channel(channel_id).await
+     }
+
+     /// Move a user to a channel by names by resolving the names to IDs.
+     pub async fn move_user_to_channel_by_names(&self, user_name: &str, channel_name: &str) -> Result<(), MumbleError> {
+         let state = self.shared_state.lock().await;
+         let session_id = state.get_user_session(user_name)
+             .ok_or(MumbleError::Channel(format!("user '{}' not found", user_name)))?;
+         let channel_id = state.channels.lock().await.find_by_name(channel_name)
+             .ok_or(MumbleError::Channel(format!("channel '{}' not found", channel_name)))?
+             .channel_id;
+         drop(state);
+         self.move_user_to_channel(session_id, channel_id).await
+     }
+
+     /// Send a text message to a channel by name.
+     pub async fn send_channel_message_by_name(&self, channel_name: &str, message: String) -> Result<(), MumbleError> {
+         let state = self.shared_state.lock().await;
+         let channel_id = state.channels.lock().await.find_by_name(channel_name)
+             .ok_or(MumbleError::Channel(format!("channel '{}' not found", channel_name)))?
+             .channel_id;
+         drop(state);
+         self.send_channel_message(channel_id, message).await
+     }
+
+     /// Send a private text message to a user by name.
+     pub async fn send_private_message_by_name(&self, user_name: &str, message: String) -> Result<(), MumbleError> {
+         let state = self.shared_state.lock().await;
+         let session_id = state.get_user_session(user_name)
+             .ok_or(MumbleError::Channel(format!("user '{}' not found", user_name)))?;
+         drop(state);
+         self.send_private_message(session_id, message).await
+     }
+
+     /// Mute a user by name.
+     pub async fn mute_user_by_name(&self, user_name: &str) -> Result<(), MumbleError> {
+         let state = self.shared_state.lock().await;
+         let session_id = state.get_user_session(user_name)
+             .ok_or(MumbleError::Channel(format!("user '{}' not found", user_name)))?;
+         drop(state);
+         self.mute_user(session_id).await
+     }
+
+     /// Unmute a user by name.
+     pub async fn unmute_user_by_name(&self, user_name: &str) -> Result<(), MumbleError> {
+         let state = self.shared_state.lock().await;
+         let session_id = state.get_user_session(user_name)
+             .ok_or(MumbleError::Channel(format!("user '{}' not found", user_name)))?;
+         drop(state);
+         self.unmute_user(session_id).await
+     }
+
+     /// Deafen a user by name.
+     pub async fn deafen_user_by_name(&self, user_name: &str) -> Result<(), MumbleError> {
+         let state = self.shared_state.lock().await;
+         let session_id = state.get_user_session(user_name)
+             .ok_or(MumbleError::Channel(format!("user '{}' not found", user_name)))?;
+         drop(state);
+         self.deafen_user(session_id).await
+     }
+
+     /// Undeafen a user by name.
+     pub async fn undeafen_user_by_name(&self, user_name: &str) -> Result<(), MumbleError> {
+         let state = self.shared_state.lock().await;
+         let session_id = state.get_user_session(user_name)
+             .ok_or(MumbleError::Channel(format!("user '{}' not found", user_name)))?;
+         drop(state);
+         self.undeafen_user(session_id).await
+     }
+
+     async fn spawn_connection_task(
         &mut self,
         stream: TlsStream<TcpStream>,
     ) -> Result<(), MumbleError> {
@@ -922,6 +1092,14 @@ async fn handle_inbound_message(
             None
         }
         Ok(MumbleMessage::UserState(message)) => {
+            {
+                let mut guard = state.lock().await;
+                if let Some(session) = message.session {
+                    if let Some(channel_id) = message.channel_id {
+                        guard.user_channels.insert(session, channel_id);
+                    }
+                }
+            }
             let _ = event_tx.send(MumbleEvent::UserState(message));
             None
         }
@@ -931,6 +1109,10 @@ async fn handle_inbound_message(
         }
         Ok(MumbleMessage::TextMessage(message)) => {
             let _ = event_tx.send(MumbleEvent::TextMessage(message));
+            None
+        }
+        Ok(MumbleMessage::PermissionDenied(message)) => {
+            let _ = event_tx.send(MumbleEvent::PermissionDenied(message));
             None
         }
         Ok(other) => {
