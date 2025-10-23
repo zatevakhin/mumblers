@@ -31,6 +31,7 @@ pub mod messages;
 pub mod proto;
 pub mod state;
 mod udp;
+pub mod server;
 
 #[cfg(feature = "audio")]
 pub use audio::{

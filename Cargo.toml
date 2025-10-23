@@ -21,6 +21,9 @@ aes = "0.8"
 cipher = "0.4"
 rand = "0.8"
 opus = { version = "0.3", optional = true }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+rustls-pemfile = "2"
 
 [build-dependencies]
 prost-build = "0.14"
