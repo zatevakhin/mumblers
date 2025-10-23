@@ -7,7 +7,7 @@ use tokio_rustls::TlsAcceptor;
 
 use super::state::{ServerState, UserInfo};
 use crate::messages::{read_envelope, write_message, MumbleMessage};
-use crate::proto::mumble::{Authenticate, ChannelState, CodecVersion, Ping, ServerSync, UserRemove, UserState, Version};
+use crate::proto::mumble::{Authenticate, ChannelState, CodecVersion, Ping, ServerSync, TextMessage, PermissionDenied, UserRemove, UserState, Version};
 
 pub async fn handle_connection(
     sock: TcpStream,
@@ -63,7 +63,41 @@ pub async fn handle_connection(
                             reply.late = Some(0);
                             reply.lost = Some(0);
                             reply.resync = Some(0);
+                            tracing::debug!(session, "server: replying to ping");
                             let _ = writer_tx.send(MumbleMessage::Ping(reply));
+                        }
+                        Ok(MumbleMessage::TextMessage(mut tm)) => {
+                            tracing::info!(session, msg = %tm.message, "server: TextMessage received");
+                            // Route: private (target sessions) takes precedence; else channel broadcast (root only)
+                            let mut delivered = false;
+                            if !tm.session.is_empty() {
+                                // Private to sessions
+                                for &target in tm.session.iter() {
+                                    if target == session { continue; }
+                                    // send to target if known
+                                    let mut out = TextMessage::default();
+                                    out.actor = Some(session);
+                                    out.message = tm.message.clone();
+                                    let _ = _state.send_to(target, MumbleMessage::TextMessage(out.clone())).await;
+                                    delivered = true;
+                                }
+                            } else {
+                                // Channel broadcast to root (id 0) for MVP
+                                let mut out = TextMessage::default();
+                                out.actor = Some(session);
+                                out.message = tm.message.clone();
+                                tracing::debug!(session, "server: broadcasting channel text to root");
+                                _state.broadcast_except(session, MumbleMessage::TextMessage(out)).await;
+                                delivered = true;
+                            }
+
+                            if !delivered {
+                                // Invalid target: reply with PermissionDenied(Text)
+                                let mut pd = PermissionDenied::default();
+                                pd.r#type = Some(1); // Text
+                                pd.reason = Some("Invalid text target".to_string());
+                                let _ = writer_tx.send(MumbleMessage::PermissionDenied(pd));
+                            }
                         }
                         Ok(_) => {
                             // Ignore other messages for now

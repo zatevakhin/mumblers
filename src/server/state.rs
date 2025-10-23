@@ -74,4 +74,14 @@ impl ServerState {
             let _ = tx.send(msg.clone());
         }
     }
+
+    pub async fn send_to(&self, session: SessionId, msg: crate::messages::MumbleMessage) -> bool {
+        let g = self.inner.read().await;
+        if let Some(tx) = g.conns.get(&session) {
+            let _ = tx.send(msg);
+            true
+        } else {
+            false
+        }
+    }
 }
