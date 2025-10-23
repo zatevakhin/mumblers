@@ -82,12 +82,16 @@ impl ServerState {
         g.conns.insert(session, tx);
     }
 
-    pub async fn broadcast_except(&self, except: SessionId, msg: crate::messages::MumbleMessage) {
+    pub async fn broadcast_except(&self, except: SessionId, msg: crate::messages::MumbleMessage) -> usize {
         let g = self.inner.read().await;
+        let mut count = 0;
         for (sess, tx) in g.conns.iter() {
             if *sess == except { continue; }
-            let _ = tx.send(msg.clone());
+            if tx.send(msg.clone()).is_ok() {
+                count += 1;
+            }
         }
+        count
     }
 
     pub async fn send_to(&self, session: SessionId, msg: crate::messages::MumbleMessage) -> bool {

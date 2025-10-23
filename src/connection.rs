@@ -271,7 +271,7 @@ impl MumbleConnection {
     /// Create a connection handle with the provided configuration.
     pub fn new(config: ConnectionConfig) -> Self {
         let state = ClientState::default();
-        let (event_tx, _event_rx) = broadcast::channel(32);
+        let (event_tx, _event_rx) = broadcast::channel(256);
         #[cfg(feature = "audio")]
         let playback = Some(Arc::new(AudioPlaybackManager::new()));
         Self {

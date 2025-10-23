@@ -64,7 +64,7 @@ pub async fn handle_connection(
                             // Connection closed or error: broadcast UserRemove
                             let mut remove = UserRemove::default();
                             remove.session = session;
-                            _state
+                            let _ = _state
                                 .broadcast_except(session, MumbleMessage::UserRemove(remove))
                                 .await;
                             _state.remove_user(session).await;
@@ -105,7 +105,7 @@ pub async fn handle_connection(
                             }
                         }
                         Ok(MumbleMessage::TextMessage(mut tm)) => {
-                            tracing::info!(session, msg = %tm.message, "server: TextMessage received");
+                            tracing::info!(session, msg = %tm.message, chans = ?tm.channel_id, targets = ?tm.session, "server: TextMessage received");
                             // Route: private (target sessions) takes precedence; else channel broadcast (root only)
                             let mut delivered = false;
                             if !tm.session.is_empty() {
@@ -118,24 +118,28 @@ pub async fn handle_connection(
                                     let mut out = TextMessage::default();
                                     out.actor = Some(session);
                                     out.message = tm.message.clone();
-                                    let _ = _state
+                                    out.session = vec![target];
+                                    let ok = _state
                                         .send_to(target, MumbleMessage::TextMessage(out.clone()))
                                         .await;
-                                    delivered = true;
+                                    tracing::info!(session, target, delivered = ok, "server: private text");
+                                    delivered = delivered || ok;
                                 }
                             } else {
                                 // Channel broadcast to root (id 0) for MVP
                                 let mut out = TextMessage::default();
                                 out.actor = Some(session);
                                 out.message = tm.message.clone();
+                                out.channel_id = tm.channel_id.clone();
                                 tracing::debug!(
                                     session,
                                     "server: broadcasting channel text to root"
                                 );
-                                _state
+                                let sent = _state
                                     .broadcast_except(session, MumbleMessage::TextMessage(out))
                                     .await;
-                                delivered = true;
+                                tracing::info!(session, sent, "server: channel text broadcasted");
+                                delivered = sent > 0;
                             }
 
                             if !delivered {
@@ -230,7 +234,7 @@ async fn handle_authenticated(
     newcomer.session = Some(session);
     newcomer.name = auth.username;
     newcomer.channel_id = Some(channel_id);
-    state
+    let _ = state
         .broadcast_except(session, MumbleMessage::UserState(newcomer))
         .await;
 
