@@ -39,7 +39,12 @@ fn load_dev_tls(cfg: &ServerConfig) -> Arc<rustls::ServerConfig> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Long-lived demo server: bind to defaults (127.0.0.1:64738) unless overridden by env/TOML
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .try_init()
+        .ok();
     let mut cfg = ServerConfig::default();
     if cfg.channels.is_empty() {
         cfg.default_channel = "Lobby".to_string();

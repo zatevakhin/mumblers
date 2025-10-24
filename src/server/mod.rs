@@ -33,6 +33,14 @@ impl MumbleServer {
         tracing::info!(%addr, "server listening");
         let tls = self.tls.clone();
         let state = ServerState::new(self.cfg.clone());
+        match state
+            .ensure_udp_bound(&state.cfg.bind_host, state.cfg.udp_bind_port)
+            .await
+        {
+            Ok(true) => conn::spawn_udp_receiver(state.clone()),
+            Ok(false) => {}
+            Err(err) => tracing::warn!(error=?err, "server: failed to pre-bind udp socket"),
+        }
 
         loop {
             let (sock, peer) = listener.accept().await?;

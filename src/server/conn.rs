@@ -9,7 +9,7 @@ use tokio_rustls::TlsAcceptor;
 
 use super::state::{ChannelError, ChannelInfo, ServerState, UserInfo, VoiceMetrics};
 use crate::crypto::ocb2::CryptStateOcb2;
-use crate::messages::{read_envelope, write_message, MumbleMessage};
+use crate::messages::{read_envelope, write_message, MumbleMessage, PROTOCOL_VERSION};
 use crate::proto::mumble::permission_denied::DenyType as PermissionDenyType;
 use crate::proto::mumble::reject::RejectType;
 use crate::proto::mumble::{
@@ -52,7 +52,11 @@ pub async fn handle_connection(
 
     let session = loop {
         let env = read_envelope(&mut tls).await?;
-        match MumbleMessage::try_from(env) {
+        let parsed = MumbleMessage::try_from(env);
+        if let Ok(ref msg) = parsed {
+            tracing::debug!(%peer, kind = message_name(msg), "server: handshake message received");
+        }
+        match parsed {
             Ok(MumbleMessage::Authenticate(auth)) => {
                 match handle_authenticated(&mut tls, _state.clone(), auth).await {
                     Ok(session) => break session,
@@ -75,7 +79,10 @@ pub async fn handle_connection(
                 write_message(&mut tls, &MumbleMessage::Ping(reply)).await?;
             }
             Ok(_) => {}
-            Err(_) => {}
+            Err(err) => {
+                tracing::debug!(%peer, error=?err, "server: failed to decode handshake message");
+                continue;
+            }
         }
     };
 
@@ -103,7 +110,11 @@ pub async fn handle_connection(
             }
         };
 
-        match MumbleMessage::try_from(env) {
+        let parsed = MumbleMessage::try_from(env);
+        if let Ok(ref msg) = parsed {
+            tracing::debug!(session, kind = message_name(msg), "server: received message");
+        }
+        match parsed {
             Ok(MumbleMessage::Ping(p)) => {
                 let mut reply = Ping::default();
                 reply.timestamp = match p.timestamp {
@@ -405,7 +416,10 @@ pub async fn handle_connection(
                 }
             }
             Ok(_) => {}
-            Err(_) => {}
+            Err(err) => {
+                tracing::debug!(session, error=?err, "server: failed to decode message");
+                continue;
+            }
         }
 
         if send_failure.is_some() {
@@ -663,7 +677,7 @@ async fn create_and_store_crypt(
     c
 }
 
-fn spawn_udp_receiver(state: ServerState) {
+pub(crate) fn spawn_udp_receiver(state: ServerState) {
     let udp_handle = state.udp.clone();
     tokio::spawn(async move {
         let mut started = false;
@@ -714,7 +728,11 @@ async fn handle_udp_datagram(
     data: Vec<u8>,
     addr: SocketAddr,
 ) -> Result<(), String> {
-    tracing::debug!(%addr, size = data.len(), "server: udp datagram received");
+    let first_byte = data.get(0).copied().unwrap_or(0);
+    tracing::debug!(%addr, size = data.len(), first_byte, "server: udp datagram received");
+    if try_handle_unencrypted_ping(state, &socket, &data, addr).await? {
+        return Ok(());
+    }
     let (session, plain, metrics) = match decrypt_datagram(state, &data, addr).await {
         Some(res) => res,
         None => {
@@ -723,6 +741,123 @@ async fn handle_udp_datagram(
         }
     };
     process_udp_plain(state, &socket, session, plain, addr, metrics).await
+}
+
+async fn try_handle_unencrypted_ping(
+    state: &ServerState,
+    socket: &Arc<tokio::net::UdpSocket>,
+    data: &[u8],
+    addr: SocketAddr,
+) -> Result<bool, String> {
+    if data.is_empty() {
+        return Ok(false);
+    }
+    if data[0] == UDP_MSG_TYPE_PING {
+        tracing::debug!(%addr, "server: plaintext proto ping detected");
+        if respond_proto_udp_probe(state, socket, &data[1..], addr).await? {
+            return Ok(true);
+        }
+        tracing::debug!(%addr, "server: plaintext proto ping decode failed, falling back");
+    }
+    if data[0] == 0 && data.len() >= 12 {
+        if data.len() == 12 {
+            tracing::debug!(%addr, "server: legacy UDP probe received");
+            respond_legacy_udp_probe(state, socket, data, addr).await?;
+            return Ok(true);
+        }
+        tracing::debug!(%addr, len = data.len(), "server: extended plaintext ping candidate");
+        if respond_proto_udp_probe(state, socket, &data[1..], addr).await? {
+            return Ok(true);
+        }
+        tracing::debug!(%addr, "server: extended ping fallback to legacy reply");
+        respond_legacy_udp_probe(state, socket, data, addr).await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+async fn respond_legacy_udp_probe(
+    state: &ServerState,
+    socket: &Arc<tokio::net::UdpSocket>,
+    data: &[u8],
+    addr: SocketAddr,
+) -> Result<(), String> {
+    let mut reply = [0u8; 24];
+    let copy_len = data.len().min(reply.len());
+    reply[..copy_len].copy_from_slice(&data[..copy_len]);
+
+    let version_v1 = ((PROTOCOL_VERSION.0 as u32) << 16)
+        | ((PROTOCOL_VERSION.1 as u32) << 8)
+        | (PROTOCOL_VERSION.2.min(255) as u32);
+    reply[0..4].copy_from_slice(&version_v1.to_be_bytes());
+
+    let users = state.list_users().await;
+    let user_count = users.len() as u32;
+    reply[12..16].copy_from_slice(&user_count.to_be_bytes());
+
+    let max_users: u32 = 0;
+    reply[16..20].copy_from_slice(&max_users.to_be_bytes());
+
+    let max_bandwidth = state.cfg.max_bandwidth.unwrap_or(0);
+    reply[20..24].copy_from_slice(&max_bandwidth.to_be_bytes());
+
+    socket
+        .send_to(&reply, addr)
+        .await
+        .map_err(|err| err.to_string())?;
+    tracing::debug!(
+        %addr,
+        version = version_v1,
+        users = user_count,
+        max_users,
+        max_bandwidth,
+        "server: legacy UDP probe answered"
+    );
+    Ok(())
+}
+
+fn protocol_version_v2() -> u64 {
+    let (major, minor, patch) = PROTOCOL_VERSION;
+    ((major as u64) << 48) | ((minor as u64) << 32) | ((patch as u64) << 16)
+}
+
+async fn respond_proto_udp_probe(
+    state: &ServerState,
+    socket: &Arc<tokio::net::UdpSocket>,
+    payload: &[u8],
+    addr: SocketAddr,
+) -> Result<bool, String> {
+    match udp_proto::Ping::decode(payload) {
+        Ok(request) => {
+            let mut reply = udp_proto::Ping::default();
+            reply.timestamp = request.timestamp;
+            reply.server_version_v2 = protocol_version_v2();
+            if request.request_extended_information {
+                let users = state.list_users().await;
+                reply.user_count = users.len() as u32;
+                reply.max_user_count = 0;
+                if let Some(bw) = state.cfg.max_bandwidth {
+                    reply.max_bandwidth_per_user = bw;
+                }
+            }
+            let mut out = reply.encode_to_vec();
+            out.insert(0, UDP_MSG_TYPE_PING);
+            socket
+                .send_to(&out, addr)
+                .await
+                .map_err(|err| err.to_string())?;
+            tracing::debug!(
+                %addr,
+                extended = request.request_extended_information,
+                "server: protobuf UDP ping answered"
+            );
+            Ok(true)
+        }
+        Err(err) => {
+            tracing::debug!(%addr, error=?err, "server: plaintext ping decode failed");
+            Ok(false)
+        }
+    }
 }
 
 async fn decrypt_datagram(
