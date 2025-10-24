@@ -2,11 +2,11 @@
 //! Iteration 12: module layout, config, TLS listener stub, framing reuse.
 
 mod config;
-mod state;
 mod conn;
+mod state;
 mod udp;
 
-pub use config::ServerConfig;
+pub use config::{ChannelConfig, ServerConfig};
 pub use state::{ServerState, SessionId};
 
 use std::net::SocketAddr;
@@ -39,7 +39,10 @@ impl MumbleServer {
             let tls = tls.clone();
             let state = state.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::server::conn::handle_connection(sock, peer, tls.clone(), state.clone()).await {
+                if let Err(e) =
+                    crate::server::conn::handle_connection(sock, peer, tls.clone(), state.clone())
+                        .await
+                {
                     tracing::warn!(%peer, error=?e, "connection ended with error");
                 }
                 // Best-effort cleanup: we don't know session id here; a more

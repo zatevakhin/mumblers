@@ -1,4 +1,7 @@
-use mumblers::{server::{MumbleServer, ServerConfig}, ConnectionConfig, MumbleConnection, MumbleEvent};
+use mumblers::{
+    server::{MumbleServer, ServerConfig},
+    ConnectionConfig, MumbleConnection, MumbleEvent,
+};
 use rcgen::generate_simple_self_signed;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -20,7 +23,9 @@ async fn start_server() -> (u16, tokio::task::JoinHandle<()>) {
     cfg.bind_port = port;
     let tls = make_tls(&cfg);
     let server = MumbleServer::new(cfg, tls);
-    let handle = tokio::spawn(async move { let _ = server.serve().await; });
+    let handle = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
     (port, handle)
 }
 
@@ -29,7 +34,12 @@ async fn cryptsetup_after_auth_and_resync() {
     let (port, _handle) = start_server().await;
     sleep(Duration::from_millis(100)).await;
 
-    let cfg = ConnectionConfig::builder("127.0.0.1").port(port).username("u1").accept_invalid_certs(true).enable_udp(false).build();
+    let cfg = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("u1")
+        .accept_invalid_certs(true)
+        .enable_udp(false)
+        .build();
     let mut c = MumbleConnection::new(cfg);
     c.connect().await.expect("connect");
 
@@ -42,14 +52,16 @@ async fn cryptsetup_after_auth_and_resync() {
     assert_eq!(udp.server_nonce.len(), 16);
 
     // Trigger resync by sending a CryptSetup with a new client_nonce directly over TCP
-    use mumblers::messages::{MumbleMessage, write_message, read_envelope};
+    use mumblers::messages::{read_envelope, write_message, MumbleMessage};
     use mumblers::proto::mumble::CryptSetup;
 
     // We don't have direct writer access; reuse the connection's internal send_message
     let new_client_nonce = vec![0xAB; 16];
     let mut cs = CryptSetup::default();
     cs.client_nonce = Some(new_client_nonce.clone());
-    c.send_message(MumbleMessage::CryptSetup(cs)).await.expect("send resync");
+    c.send_message(MumbleMessage::CryptSetup(cs))
+        .await
+        .expect("send resync");
 
     // Allow time for server to respond with new server_nonce and for client to process it
     sleep(Duration::from_millis(200)).await;

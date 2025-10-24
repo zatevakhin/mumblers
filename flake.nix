@@ -20,7 +20,7 @@
         };
       in {
         devShells.default = pkgs.mkShell {
-          buildInputs = [rustToolchain pkgs.libopus pkgs.cmake];
+          buildInputs = [rustToolchain pkgs.libopus pkgs.cmake pkgs.python3];
 
           shellHook = ''
             export CMAKE_POLICY_VERSION_MINIMUM=3.5

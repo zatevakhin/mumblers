@@ -13,7 +13,7 @@ struct Args {
     port: u16,
 
     /// Username to use
-    #[arg(short = 'u', long, default_value = "mumble-rs")] 
+    #[arg(short = 'u', long, default_value = "mumble-rs")]
     username: String,
 
     /// Channel name to send into
@@ -45,8 +45,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure handshake settles
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     conn.join_channel_by_name(&args.channel).await?;
-    conn.send_channel_message_by_name(&args.channel, args.message).await?;
-    println!("Message sent to '{}'@{}:{}", args.channel, args.host, args.port);
+    conn.send_channel_message_by_name(&args.channel, args.message)
+        .await?;
+    println!(
+        "Message sent to '{}'@{}:{}",
+        args.channel, args.host, args.port
+    );
     Ok(())
 }
-

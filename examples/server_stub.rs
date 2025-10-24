@@ -1,7 +1,7 @@
 use mumblers::server::{MumbleServer, ServerConfig};
+use rcgen::generate_simple_self_signed;
 use std::sync::Arc;
 use tokio_rustls::rustls;
-use rcgen::generate_simple_self_signed;
 
 fn load_dev_tls(cfg: &ServerConfig) -> Arc<rustls::ServerConfig> {
     // Load from config if provided, else build an in-memory self-signed via rcgen in dev.
@@ -40,7 +40,39 @@ fn load_dev_tls(cfg: &ServerConfig) -> Arc<rustls::ServerConfig> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Long-lived demo server: bind to defaults (127.0.0.1:64738) unless overridden by env/TOML
     tracing_subscriber::fmt().with_env_filter("info").init();
-    let cfg = ServerConfig::default();
+    let mut cfg = ServerConfig::default();
+    if cfg.channels.is_empty() {
+        cfg.default_channel = "Lobby".to_string();
+        cfg.channels = vec![
+            mumblers::server::ChannelConfig {
+                name: "Lobby".to_string(),
+                parent: Some("Root".to_string()),
+                description: Some("Default landing channel".to_string()),
+                position: Some(1),
+                max_users: None,
+                noenter: None,
+                silent: None,
+            },
+            mumblers::server::ChannelConfig {
+                name: "Games".to_string(),
+                parent: Some("Lobby".to_string()),
+                description: Some("Drop in to play together".to_string()),
+                position: Some(2),
+                max_users: None,
+                noenter: None,
+                silent: None,
+            },
+            mumblers::server::ChannelConfig {
+                name: "AFK".to_string(),
+                parent: Some("Root".to_string()),
+                description: Some("Read-only parking slot".to_string()),
+                position: Some(3),
+                max_users: Some(2),
+                noenter: Some(true),
+                silent: None,
+            },
+        ];
+    }
     let tls = load_dev_tls(&cfg);
     let server = MumbleServer::new(cfg, tls);
     server.serve().await.unwrap();

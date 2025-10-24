@@ -65,17 +65,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn print_channel_tree(channels: &mumblers::channels::Channels, state: &mumblers::state::ClientState, channel_id: u32, depth: usize) {
+fn print_channel_tree(
+    channels: &mumblers::channels::Channels,
+    state: &mumblers::state::ClientState,
+    channel_id: u32,
+    depth: usize,
+) {
     if let Some(channel) = channels.get(channel_id) {
         let indent = "  ".repeat(depth);
-        println!("{}{}", indent, channel.name.as_deref().unwrap_or("Unnamed Channel"));
+        println!(
+            "{}{}",
+            indent,
+            channel.name.as_deref().unwrap_or("Unnamed Channel")
+        );
 
         // List users in this channel
         let users = state.get_users_in_channel(channel_id);
         if !users.is_empty() {
-            let user_names: Vec<String> = users.iter()
+            let user_names: Vec<String> = users
+                .iter()
                 .map(|&session| {
-                    state.users.get(&session)
+                    state
+                        .users
+                        .get(&session)
                         .cloned()
                         .unwrap_or_else(|| format!("Unknown User (session: {})", session))
                 })

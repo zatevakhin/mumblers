@@ -1,4 +1,7 @@
-use mumblers::{server::{MumbleServer, ServerConfig}, ConnectionConfig, MumbleConnection};
+use mumblers::{
+    server::{MumbleServer, ServerConfig},
+    ConnectionConfig, MumbleConnection,
+};
 use rcgen::generate_simple_self_signed;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -21,7 +24,9 @@ async fn start_server() -> (u16, tokio::task::JoinHandle<()>) {
     cfg.bind_port = port;
     let tls = make_tls(&cfg);
     let server = MumbleServer::new(cfg, tls);
-    let handle = tokio::spawn(async move { let _ = server.serve().await; });
+    let handle = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
     (port, handle)
 }
 
@@ -30,17 +35,27 @@ async fn channel_text_broadcast() {
     let (port, _handle) = start_server().await;
     sleep(Duration::from_millis(100)).await;
 
-    let cfg_a = ConnectionConfig::builder("127.0.0.1").port(port).username("A").accept_invalid_certs(true).build();
+    let cfg_a = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("A")
+        .accept_invalid_certs(true)
+        .build();
     let mut a = MumbleConnection::new(cfg_a);
     a.connect().await.expect("a connect");
-    let cfg_b = ConnectionConfig::builder("127.0.0.1").port(port).username("B").accept_invalid_certs(true).build();
+    let cfg_b = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("B")
+        .accept_invalid_certs(true)
+        .build();
     let mut b = MumbleConnection::new(cfg_b);
     b.connect().await.expect("b connect");
     sleep(Duration::from_millis(200)).await;
 
     // Send channel text from A; B should receive
     // Root channel is id 0 by default
-    a.send_channel_message(0, "hi from A".to_string()).await.ok();
+    a.send_channel_message(0, "hi from A".to_string())
+        .await
+        .ok();
     // Give time to deliver; we don't have a direct event recv API exposed here, so we check no crash.
     sleep(Duration::from_millis(150)).await;
 }
@@ -50,22 +65,34 @@ async fn private_text_routing_and_invalid_target() {
     let (port, _handle) = start_server().await;
     sleep(Duration::from_millis(100)).await;
 
-    let cfg_a = ConnectionConfig::builder("127.0.0.1").port(port).username("A").accept_invalid_certs(true).build();
+    let cfg_a = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("A")
+        .accept_invalid_certs(true)
+        .build();
     let mut a = MumbleConnection::new(cfg_a);
     a.connect().await.expect("a connect");
     let a_sess = a.state().await.session_id.unwrap();
 
-    let cfg_b = ConnectionConfig::builder("127.0.0.1").port(port).username("B").accept_invalid_certs(true).build();
+    let cfg_b = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("B")
+        .accept_invalid_certs(true)
+        .build();
     let mut b = MumbleConnection::new(cfg_b);
     b.connect().await.expect("b connect");
     sleep(Duration::from_millis(200)).await;
 
     // Private message from A to B
     if let Some(b_sess) = b.state().await.session_id {
-        a.send_private_message(b_sess, "secret".to_string()).await.ok();
+        a.send_private_message(b_sess, "secret".to_string())
+            .await
+            .ok();
     }
     sleep(Duration::from_millis(150)).await;
 
     // Invalid target: use a very large session id
-    let _ = a.send_private_message(0xFFFF_FFFE, "nobody".to_string()).await; // server should not crash; may emit PermissionDenied
+    let _ = a
+        .send_private_message(0xFFFF_FFFE, "nobody".to_string())
+        .await; // server should not crash; may emit PermissionDenied
 }

@@ -29,9 +29,9 @@ pub mod crypto;
 pub mod error;
 pub mod messages;
 pub mod proto;
+pub mod server;
 pub mod state;
 mod udp;
-pub mod server;
 
 #[cfg(feature = "audio")]
 pub use audio::{

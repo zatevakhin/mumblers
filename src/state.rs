@@ -36,32 +36,30 @@ pub struct ClientState {
     pub channels: SharedChannels,
 }
 
- impl ClientState {
-     pub fn get_users_in_channel(&self, channel_id: u32) -> Vec<u32> {
-         self.user_channels
-             .iter()
-             .filter_map(|(session, &ch_id)| {
-                 if ch_id == channel_id {
-                     Some(*session)
-                 } else {
-                     None
-                 }
-             })
-             .collect()
-     }
+impl ClientState {
+    pub fn get_users_in_channel(&self, channel_id: u32) -> Vec<u32> {
+        self.user_channels
+            .iter()
+            .filter_map(|(session, &ch_id)| {
+                if ch_id == channel_id {
+                    Some(*session)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 
-     pub fn get_user_session(&self, name: &str) -> Option<u32> {
-         self.users
-             .iter()
-             .find_map(|(session, user_name)| {
-                 if user_name == name {
-                     Some(*session)
-                 } else {
-                     None
-                 }
-             })
-     }
- }
+    pub fn get_user_session(&self, name: &str) -> Option<u32> {
+        self.users.iter().find_map(|(session, user_name)| {
+            if user_name == name {
+                Some(*session)
+            } else {
+                None
+            }
+        })
+    }
+}
 
 impl Default for ClientState {
     fn default() -> Self {
