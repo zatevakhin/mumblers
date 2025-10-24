@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::rustls::ServerConfig as TlsServerConfig;
 use tokio_rustls::TlsAcceptor;
 
-use super::state::{ChannelError, ChannelInfo, ServerState, UserInfo};
+use super::state::{ChannelError, ChannelInfo, ServerState, UserInfo, VoiceMetrics};
 use crate::crypto::ocb2::CryptStateOcb2;
 use crate::messages::{read_envelope, write_message, MumbleMessage};
 use crate::proto::mumble::permission_denied::DenyType as PermissionDenyType;
@@ -21,6 +21,8 @@ use prost::Message;
 use rand::RngCore;
 
 const CONN_QUEUE_CAPACITY: usize = 256;
+const UDP_MSG_TYPE_AUDIO: u8 = 0;
+const UDP_MSG_TYPE_PING: u8 = 1;
 
 #[derive(Debug)]
 struct HandshakeRejected;
@@ -122,28 +124,57 @@ pub async fn handle_connection(
                 }
             }
             Ok(MumbleMessage::CryptSetup(req)) => {
-                if let Some(cn) = req.client_nonce.as_ref() {
-                    if cn.len() == 16 {
-                        let mut cs = _state
-                            .get_crypt(session)
-                            .await
-                            .unwrap_or(create_and_store_crypt(session, &_state).await);
-                        cs.client_nonce.copy_from_slice(&cn[..16]);
-                        cs.server_nonce = rand_nonce();
-                        _state.set_crypt(session, cs).await;
-                        let mut resp = CryptSetup::default();
-                        resp.server_nonce = Some(cs.server_nonce.to_vec());
-                        if let Err(err) = writer_tx.send(MumbleMessage::CryptSetup(resp)).await {
-                            tracing::warn!(
-                                session,
-                                error = ?err,
-                                "server: failed to queue crypt setup reply"
-                            );
-                            send_failure = Some(Box::new(io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                err.to_string(),
-                            )));
-                        }
+                let mut cs = _state
+                    .get_crypt(session)
+                    .await
+                    .unwrap_or(create_and_store_crypt(session, &_state).await);
+
+                let mut updated = false;
+
+                if let Some(key) = req.key.as_ref() {
+                    if key.len() == 16 {
+                        cs.key.copy_from_slice(&key[..16]);
+                        updated = true;
+                    } else {
+                        tracing::debug!(session, "server: ignoring short crypt key");
+                    }
+                }
+
+                if let Some(server) = req.server_nonce.as_ref() {
+                    if server.len() == 16 {
+                        cs.server_nonce.copy_from_slice(&server[..16]);
+                        updated = true;
+                    } else {
+                        tracing::debug!(session, "server: ignoring short server nonce");
+                    }
+                }
+
+                if let Some(client) = req.client_nonce.as_ref() {
+                    if client.len() == 16 {
+                        cs.client_nonce.copy_from_slice(&client[..16]);
+                        updated = true;
+                    } else {
+                        tracing::debug!(session, "server: ignoring short client nonce");
+                    }
+                }
+
+                if updated {
+                    _state.set_crypt(session, cs).await;
+                }
+
+                if req.client_nonce.is_none() {
+                    let mut resp = CryptSetup::default();
+                    resp.server_nonce = Some(cs.server_nonce.to_vec());
+                    if let Err(err) = writer_tx.send(MumbleMessage::CryptSetup(resp)).await {
+                        tracing::warn!(
+                            session,
+                            error = ?err,
+                            "server: failed to queue crypt setup reply"
+                        );
+                        send_failure = Some(Box::new(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            err.to_string(),
+                        )));
                     }
                 }
             }
@@ -648,44 +679,24 @@ fn spawn_udp_receiver(state: ServerState) {
                     started = true;
                 }
                 let mut buf = [0u8; 1500];
-                match (&*sock).recv_from(&mut buf).await {
+                match sock.recv_from(&mut buf).await {
                     Ok((n, addr)) => {
-                        // Try match against crypt entries
-                        let entries = state.crypt_entries().await;
-                        for (sess, crypt) in entries {
-                            // Attempt decrypt as Udp Ping
-                            let mut cs = CryptStateOcb2::new();
-                            cs.set_key(&crypt.key, &crypt.client_nonce, &crypt.server_nonce);
-                            if let Ok(decrypted) = cs.decrypt(&buf[..n]) {
-                                // Try decode as ping
-                                if let Ok(p) = udp_proto::Ping::decode(&*decrypted) {
-                                    // Pair if needed
-                                    if state.get_udp_pair(sess).await.is_none() {
-                                        state.set_udp_pair(sess, addr).await;
-                                        tracing::info!(session=sess, %addr, "udp paired");
-                                    }
-                                    tracing::debug!(session=sess, ts=?p.timestamp, "udp ping recv");
-                                    // Echo back same timestamp
-                                    let mut echo = udp_proto::Ping::default();
-                                    echo.timestamp = p.timestamp;
-                                    let mut payload = Vec::new();
-                                    if prost::Message::encode(&echo, &mut payload).is_ok() {
-                                        let mut cs2 = CryptStateOcb2::new();
-                                        cs2.set_key(
-                                            &crypt.key,
-                                            &crypt.client_nonce,
-                                            &crypt.server_nonce,
-                                        );
-                                        if let Ok(enc) = cs2.encrypt(&payload) {
-                                            let _ = (&*sock).send_to(&enc, addr).await;
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
+                        if n == 0 {
+                            continue;
+                        }
+                        let data = buf[..n].to_vec();
+                        if let Err(err) =
+                            handle_udp_datagram(&state, Arc::clone(&sock), data, addr).await
+                        {
+                            tracing::debug!(
+                                error = ?err,
+                                addr = %addr,
+                                "server: udp datagram handling failed"
+                            );
                         }
                     }
-                    Err(_) => {
+                    Err(err) => {
+                        tracing::warn!(error=?err, "server: udp receive failed");
                         break;
                     }
                 }
@@ -695,4 +706,283 @@ fn spawn_udp_receiver(state: ServerState) {
             }
         }
     });
+}
+
+async fn handle_udp_datagram(
+    state: &ServerState,
+    socket: Arc<tokio::net::UdpSocket>,
+    data: Vec<u8>,
+    addr: SocketAddr,
+) -> Result<(), String> {
+    tracing::debug!(%addr, size = data.len(), "server: udp datagram received");
+    let (session, plain, metrics) = match decrypt_datagram(state, &data, addr).await {
+        Some(res) => res,
+        None => {
+            tracing::debug!(%addr, "server: udp datagram ignored (no crypt match)");
+            return Ok(());
+        }
+    };
+    process_udp_plain(state, &socket, session, plain, addr, metrics).await
+}
+
+async fn decrypt_datagram(
+    state: &ServerState,
+    data: &[u8],
+    addr: SocketAddr,
+) -> Option<(super::state::SessionId, Vec<u8>, VoiceMetrics)> {
+    if let Some(session) = state.session_by_udp_addr(&addr).await {
+        if let Some(crypt_arc) = state.crypt_state(session).await {
+            let mut guard = crypt_arc.lock().await;
+            match guard.decrypt(data) {
+                Ok(plain) => {
+                    let metrics = VoiceMetrics {
+                        good: guard.ui_good,
+                        late: guard.ui_late,
+                        lost: guard.ui_lost,
+                    };
+                    return Some((session, plain, metrics));
+                }
+                Err(err) => {
+                    tracing::debug!(session, error=?err, %addr, "server: udp decrypt failed");
+                    return None;
+                }
+            }
+        }
+    }
+
+    let entries = state.crypt_entries().await;
+    for (session, crypt) in entries {
+        let mut trial = CryptStateOcb2::new();
+        trial.set_key(&crypt.key, &crypt.server_nonce, &crypt.client_nonce);
+        if let Ok(plain) = trial.decrypt(data) {
+            let metrics = VoiceMetrics {
+                good: trial.ui_good,
+                late: trial.ui_late,
+                lost: trial.ui_lost,
+            };
+            if let Some(arc) = state.crypt_state(session).await {
+                let mut guard = arc.lock().await;
+                *guard = trial.clone();
+            } else {
+                state.set_crypt(session, crypt).await;
+                if let Some(arc) = state.crypt_state(session).await {
+                    let mut guard = arc.lock().await;
+                    *guard = trial.clone();
+                }
+            }
+            state.set_udp_pair(session, addr).await;
+            tracing::info!(session, %addr, "udp paired");
+            return Some((session, plain, metrics));
+        }
+    }
+    None
+}
+
+async fn process_udp_plain(
+    state: &ServerState,
+    socket: &Arc<tokio::net::UdpSocket>,
+    session: super::state::SessionId,
+    plain: Vec<u8>,
+    addr: SocketAddr,
+    metrics: VoiceMetrics,
+) -> Result<(), String> {
+    if plain.is_empty() {
+        return Ok(());
+    }
+    match plain[0] {
+        UDP_MSG_TYPE_PING => handle_udp_ping(state, socket, session, &plain[1..], addr).await,
+        UDP_MSG_TYPE_AUDIO => handle_udp_audio(state, socket, session, &plain[1..], metrics).await,
+        other => {
+            tracing::debug!(session, ty = other, "server: unknown UDP message type");
+            Ok(())
+        }
+    }
+}
+
+async fn handle_udp_ping(
+    state: &ServerState,
+    socket: &Arc<tokio::net::UdpSocket>,
+    session: super::state::SessionId,
+    payload: &[u8],
+    addr: SocketAddr,
+) -> Result<(), String> {
+    match udp_proto::Ping::decode(payload) {
+        Ok(mut ping) => {
+            tracing::debug!(session, ts=?ping.timestamp, "server: udp ping received");
+            if ping.request_extended_information {
+                let users = state.list_users().await;
+                ping.user_count = users.len() as u32;
+                ping.max_user_count = users.len() as u32;
+                if let Some(bw) = state.cfg.max_bandwidth {
+                    ping.max_bandwidth_per_user = bw;
+                }
+            }
+            let mut out = ping.encode_to_vec();
+            out.insert(0, UDP_MSG_TYPE_PING);
+            send_udp_plain(socket, state, session, addr, &out)
+                .await
+                .map_err(|err| err.to_string())
+        }
+        Err(err) => {
+            tracing::debug!(session, error=?err, "server: failed to decode udp ping");
+            Err(err.to_string())
+        }
+    }
+}
+
+async fn handle_udp_audio(
+    state: &ServerState,
+    socket: &Arc<tokio::net::UdpSocket>,
+    session: super::state::SessionId,
+    payload: &[u8],
+    metrics: VoiceMetrics,
+) -> Result<(), String> {
+    let mut audio =
+        udp_proto::Audio::decode(payload).map_err(|err| format!("decode audio failed: {err}"))?;
+    audio.sender_session = session;
+    let frame_number = if audio.frame_number == 0 {
+        None
+    } else {
+        Some(audio.frame_number)
+    };
+
+    let header = match audio.header.clone() {
+        Some(h) => h,
+        None => {
+            tracing::debug!(session, "server: audio packet missing header");
+            return Err("audio missing header".into());
+        }
+    };
+    tracing::info!(
+        session,
+        frame = audio.frame_number,
+        header = ?header,
+        "server: udp audio received"
+    );
+
+    match header {
+        udp_proto::audio::Header::Target(target) => {
+            if target == 0x1f {
+                // Loopback
+                let mut loopback = audio.clone();
+                loopback.header = Some(udp_proto::audio::Header::Context(0));
+                let mut payload = loopback.encode_to_vec();
+                payload.insert(0, UDP_MSG_TYPE_AUDIO);
+                if let Some(addr) = state.get_udp_pair(session).await {
+                    if let Err(err) = send_udp_plain(socket, state, session, addr, &payload).await {
+                        tracing::debug!(session, error=?err, "server: loopback audio send failed");
+                    }
+                } else {
+                    tracing::debug!(session, "server: loopback audio dropped (no udp pair)");
+                }
+            } else if target == 0 {
+                route_channel_audio(state, socket, session, &audio).await?;
+            } else {
+                tracing::debug!(session, target, "server: unsupported voice target");
+            }
+        }
+        udp_proto::audio::Header::Context(_) => {
+            // Already contextualised – forward as-is to channel peers.
+            route_channel_audio(state, socket, session, &audio).await?;
+        }
+    }
+
+    state
+        .record_voice_packet(session, frame_number, metrics)
+        .await;
+    Ok(())
+}
+
+async fn route_channel_audio(
+    state: &ServerState,
+    socket: &Arc<tokio::net::UdpSocket>,
+    session: super::state::SessionId,
+    audio: &udp_proto::Audio,
+) -> Result<(), String> {
+    let user = match state.user_info(session).await {
+        Some(info) => info,
+        None => {
+            tracing::debug!(session, "server: channel audio from unknown session");
+            return Err("unknown session".into());
+        }
+    };
+    if let Some(info) = state.channel_info(user.channel_id).await {
+        if info.silent {
+            tracing::debug!(
+                session,
+                channel = info.id,
+                "server: channel is silent; dropping audio"
+            );
+            return Ok(());
+        }
+    }
+    let recipients = state.channel_members(user.channel_id).await;
+    for target in recipients {
+        if target == session {
+            continue;
+        }
+        let addr = match state.get_udp_pair(target).await {
+            Some(addr) => addr,
+            None => {
+                tracing::debug!(session, target, "server: skipping audio, no UDP pair");
+                continue;
+            }
+        };
+        let mut packet = audio.clone();
+        packet.header = Some(udp_proto::audio::Header::Context(0));
+        packet.sender_session = session;
+        let mut payload = packet.encode_to_vec();
+        payload.insert(0, UDP_MSG_TYPE_AUDIO);
+        tracing::info!(
+            session,
+            target,
+            frame = packet.frame_number,
+            "server: forwarding audio frame"
+        );
+        if let Err(err) = send_udp_plain(socket, state, target, addr, &payload).await {
+            tracing::debug!(
+                session,
+                target,
+                error=?err,
+                "server: failed to forward audio"
+            );
+        } else {
+            tracing::trace!(session, target, "server: forwarded audio frame");
+        }
+    }
+    Ok(())
+}
+
+async fn send_udp_plain(
+    socket: &Arc<tokio::net::UdpSocket>,
+    state: &ServerState,
+    session: super::state::SessionId,
+    addr: SocketAddr,
+    payload: &[u8],
+) -> Result<(), std::io::Error> {
+    let crypt_arc = match state.crypt_state(session).await {
+        Some(arc) => arc,
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "missing crypt state",
+            ));
+        }
+    };
+    let encrypted = {
+        let mut guard = crypt_arc.lock().await;
+        let encrypted = guard.encrypt(payload).map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::Other, format!("encrypt failed: {err}"))
+        })?;
+        encrypted
+    };
+    if let Some(raw) = state.get_crypt(session).await {
+        let mut client_view = CryptStateOcb2::new();
+        client_view.set_key(&raw.key, &raw.client_nonce, &raw.server_nonce);
+        if let Err(err) = client_view.decrypt(&encrypted) {
+            tracing::debug!(session, error=?err, "server: client-view decrypt failed");
+        }
+    }
+    socket.send_to(&encrypted, addr).await?;
+    Ok(())
 }

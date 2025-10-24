@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 
 use super::config::{ChannelConfig, ServerConfig};
+use crate::crypto::ocb2::CryptStateOcb2;
 use crate::messages::MumbleMessage;
 
 pub type SessionId = u32;
@@ -34,6 +36,36 @@ pub struct UdpCrypt {
     pub client_nonce: [u8; 16],
 }
 
+#[derive(Debug, Clone)]
+pub struct VoiceStats {
+    pub packets: u64,
+    pub last_frame: Option<u64>,
+    pub last_update: Option<Instant>,
+    pub good: u32,
+    pub late: u32,
+    pub lost: i32,
+}
+
+impl Default for VoiceStats {
+    fn default() -> Self {
+        Self {
+            packets: 0,
+            last_frame: None,
+            last_update: None,
+            good: 0,
+            late: 0,
+            lost: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VoiceMetrics {
+    pub good: u32,
+    pub late: u32,
+    pub lost: i32,
+}
+
 #[derive(Debug)]
 pub enum ChannelError {
     UnknownUser(SessionId),
@@ -50,6 +82,9 @@ struct InnerState {
     conns: HashMap<SessionId, mpsc::Sender<MumbleMessage>>,
     crypt: HashMap<SessionId, UdpCrypt>,
     udp_pair: HashMap<SessionId, SocketAddr>,
+    udp_pair_by_addr: HashMap<SocketAddr, SessionId>,
+    crypt_states: HashMap<SessionId, Arc<tokio::sync::Mutex<CryptStateOcb2>>>,
+    voice_stats: HashMap<SessionId, VoiceStats>,
     channels: HashMap<u32, ChannelInfo>,
     channel_name_idx: HashMap<String, u32>,
     channel_members: HashMap<u32, HashSet<SessionId>>,
@@ -74,6 +109,9 @@ impl ServerState {
                 conns: HashMap::new(),
                 crypt: HashMap::new(),
                 udp_pair: HashMap::new(),
+                udp_pair_by_addr: HashMap::new(),
+                crypt_states: HashMap::new(),
+                voice_stats: HashMap::new(),
                 channels,
                 channel_name_idx: name_idx,
                 channel_members: members,
@@ -164,7 +202,11 @@ impl ServerState {
         }
         g.conns.remove(&session);
         g.crypt.remove(&session);
-        g.udp_pair.remove(&session);
+        if let Some(addr) = g.udp_pair.remove(&session) {
+            g.udp_pair_by_addr.remove(&addr);
+        }
+        g.crypt_states.remove(&session);
+        g.voice_stats.remove(&session);
     }
 
     pub async fn list_users(&self) -> Vec<UserInfo> {
@@ -322,8 +364,24 @@ impl ServerState {
     }
 
     pub async fn set_crypt(&self, session: SessionId, c: UdpCrypt) {
-        let mut g = self.inner.write().await;
-        g.crypt.insert(session, c);
+        let key = c.key;
+        let server_nonce = c.server_nonce;
+        let client_nonce = c.client_nonce;
+        let entry = {
+            let mut g = self.inner.write().await;
+            g.crypt.insert(session, c);
+            g.voice_stats.entry(session).or_default();
+            g.crypt_states
+                .entry(session)
+                .or_insert_with(|| {
+                    let mut cs = CryptStateOcb2::new();
+                    cs.set_key(&key, &server_nonce, &client_nonce);
+                    Arc::new(tokio::sync::Mutex::new(cs))
+                })
+                .clone()
+        };
+        let mut guard = entry.lock().await;
+        guard.set_key(&key, &server_nonce, &client_nonce);
     }
 
     pub async fn get_crypt(&self, session: SessionId) -> Option<UdpCrypt> {
@@ -353,7 +411,10 @@ impl ServerState {
 
     pub async fn set_udp_pair(&self, session: SessionId, addr: SocketAddr) {
         let mut g = self.inner.write().await;
-        g.udp_pair.insert(session, addr);
+        if let Some(prev) = g.udp_pair.insert(session, addr) {
+            g.udp_pair_by_addr.remove(&prev);
+        }
+        g.udp_pair_by_addr.insert(addr, session);
     }
 
     pub async fn get_udp_pair(&self, session: SessionId) -> Option<SocketAddr> {
@@ -361,9 +422,48 @@ impl ServerState {
         g.udp_pair.get(&session).copied()
     }
 
+    pub async fn session_by_udp_addr(&self, addr: &SocketAddr) -> Option<SessionId> {
+        let g = self.inner.read().await;
+        g.udp_pair_by_addr.get(addr).copied()
+    }
+
     pub async fn udp_socket(&self) -> Option<Arc<tokio::net::UdpSocket>> {
         let guard = self.udp.lock().await;
         guard.clone()
+    }
+
+    pub async fn crypt_state(
+        &self,
+        session: SessionId,
+    ) -> Option<Arc<tokio::sync::Mutex<CryptStateOcb2>>> {
+        let g = self.inner.read().await;
+        g.crypt_states.get(&session).cloned()
+    }
+
+    pub async fn channel_members(&self, channel_id: u32) -> Vec<SessionId> {
+        let g = self.inner.read().await;
+        g.channel_members
+            .get(&channel_id)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    pub async fn record_voice_packet(
+        &self,
+        session: SessionId,
+        frame_number: Option<u64>,
+        metrics: VoiceMetrics,
+    ) {
+        let mut g = self.inner.write().await;
+        let stats = g.voice_stats.entry(session).or_default();
+        stats.packets = stats.packets.saturating_add(1);
+        if let Some(frame) = frame_number {
+            stats.last_frame = Some(frame);
+        }
+        stats.last_update = Some(Instant::now());
+        stats.good = metrics.good;
+        stats.late = metrics.late;
+        stats.lost = metrics.lost;
     }
 }
 

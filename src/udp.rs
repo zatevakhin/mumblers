@@ -200,7 +200,9 @@ async fn send_audio(
     crypt: &Arc<Mutex<CryptStateOcb2>>,
     packet: VoicePacket,
 ) -> std::io::Result<()> {
-    let mut payload = packet.into_proto().encode_to_vec();
+    let proto = packet.into_proto();
+    let frame = proto.frame_number;
+    let mut payload = proto.encode_to_vec();
     payload.insert(0, MSG_TYPE_AUDIO);
     let encrypted = {
         let mut guard = crypt.lock().await;
@@ -208,6 +210,7 @@ async fn send_audio(
             .encrypt(&payload)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?
     };
+    tracing::debug!(frame, bytes = encrypted.len(), "client: udp audio sent");
     socket.send(&encrypted).await?;
     Ok(())
 }

@@ -25,7 +25,7 @@ pub enum DecryptError {
     TamperedBlock,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CryptStateOcb2 {
     aes: Aes128,
     raw_key: [u8; BLOCK_SIZE],
