@@ -24,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = ConnectionConfig::builder(&args.host)
         .accept_invalid_certs(true)
         .enable_udp(true)
+        .username("recorder")
         .build();
     if let Ok(username) = std::env::var("MUMBLE_USERNAME") {
         config.username = username;
