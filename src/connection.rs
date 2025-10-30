@@ -1,5 +1,6 @@
 use std::convert::TryFrom;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 #[cfg(feature = "audio")]
 use std::time::Instant;
@@ -47,10 +48,9 @@ enum CryptUpdate {
     },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct UdpOptions {
-    host: String,
-    port: u16,
+    target: Option<SocketAddr>,
     enable: bool,
 }
 
@@ -142,12 +142,48 @@ pub struct ConnectionConfig {
     pub enable_udp: bool,
 }
 
+fn normalize_host_and_port(raw: &str) -> (String, Option<u16>) {
+    if raw.is_empty() {
+        return (raw.to_string(), None);
+    }
+
+    if raw.starts_with('[') {
+        if let Some(end) = raw.find(']') {
+            let host = raw[1..end].to_string();
+            let remainder = &raw[end + 1..];
+            if let Some(stripped) = remainder.strip_prefix(':') {
+                if let Ok(port) = stripped.parse::<u16>() {
+                    return (host, Some(port));
+                }
+            }
+            return (host, None);
+        }
+    }
+
+    if let Some(idx) = raw.rfind(':') {
+        if raw[..idx].contains(':') {
+            return (raw.to_string(), None);
+        }
+        let (host_part, port_part) = raw.split_at(idx);
+        let port_str = &port_part[1..];
+        if !port_str.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(port) = port_str.parse::<u16>() {
+                return (host_part.to_string(), Some(port));
+            }
+        }
+    }
+
+    (raw.to_string(), None)
+}
+
 impl ConnectionConfig {
     /// Create a new configuration for the given host, using the default port.
     pub fn new(host: impl Into<String>) -> Self {
+        let raw_host = host.into();
+        let (host, port_override) = normalize_host_and_port(&raw_host);
         Self {
-            host: host.into(),
-            port: 64738,
+            host,
+            port: port_override.unwrap_or(64738),
             tls_server_name: None,
             connect_timeout: Duration::from_secs(10),
             accept_invalid_certs: true,
@@ -265,6 +301,7 @@ pub struct MumbleConnection {
     audio_playback: Option<Arc<AudioPlaybackManager>>,
     #[cfg(feature = "audio")]
     audio_task: Option<JoinHandle<()>>,
+    udp_target: Option<SocketAddr>,
 }
 
 impl MumbleConnection {
@@ -286,6 +323,7 @@ impl MumbleConnection {
             audio_playback: playback,
             #[cfg(feature = "audio")]
             audio_task: None,
+            udp_target: None,
         }
     }
 
@@ -297,8 +335,7 @@ impl MumbleConnection {
             ));
         }
 
-        let addr = format!("{}:{}", self.config.host, self.config.port);
-        let tcp_future = TcpStream::connect(&addr);
+        let tcp_future = TcpStream::connect((self.config.host.as_str(), self.config.port));
         let tcp_stream = match timeout(self.config.connect_timeout, tcp_future).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(err)) => return Err(MumbleError::Network(err)),
@@ -311,6 +348,11 @@ impl MumbleConnection {
         };
 
         tcp_stream.set_nodelay(true)?;
+        self.udp_target = Some(
+            tcp_stream
+                .peer_addr()
+                .map_err(MumbleError::Network)?,
+        );
 
         let server_name_str = self
             .config
@@ -870,8 +912,7 @@ impl MumbleConnection {
         let shared_state = Arc::clone(&self.shared_state);
         let event_tx = self.event_tx.clone();
         let udp_options = UdpOptions {
-            host: self.config.host.clone(),
-            port: self.config.port,
+            target: self.udp_target,
             enable: self.config.enable_udp,
         };
 
@@ -996,14 +1037,16 @@ async fn connection_loop(
     let mut udp_tunnel: Option<UdpTunnel> = None;
 
     if udp_options.enable {
+        if udp_options.target.is_none() {
+            tracing::warn!("UDP enabled but no resolved target address; skipping tunnel startup");
+        }
         let initial_params = {
             let guard = state.lock().await;
             guard.udp.clone()
         };
-        if let Some(params) = initial_params {
+        if let (Some(params), Some(target)) = (initial_params, udp_options.target) {
             match UdpTunnel::start(
-                udp_options.host.clone(),
-                udp_options.port,
+                target,
                 Arc::new(params),
                 event_tx.clone(),
                 #[cfg(feature = "audio")]
@@ -1373,21 +1416,26 @@ async fn handle_crypt_update(
                     tracing::warn!("failed to update UDP key: {err}");
                 }
             } else {
-                match UdpTunnel::start(
-                    udp_options.host.clone(),
-                    udp_options.port,
-                    Arc::clone(&arc_params),
-                    event_tx.clone(),
-                    #[cfg(feature = "audio")]
-                    playback.clone(),
-                )
-                .await
-                {
-                    Ok(tunnel) => {
-                        tracing::info!("UDP tunnel established");
-                        *udp_tunnel = Some(tunnel);
+                if let Some(target) = udp_options.target {
+                    match UdpTunnel::start(
+                        target,
+                        Arc::clone(&arc_params),
+                        event_tx.clone(),
+                        #[cfg(feature = "audio")]
+                        playback.clone(),
+                    )
+                    .await
+                    {
+                        Ok(tunnel) => {
+                            tracing::info!("UDP tunnel established");
+                            *udp_tunnel = Some(tunnel);
+                        }
+                        Err(err) => tracing::warn!("failed to start UDP tunnel: {err}"),
                     }
-                    Err(err) => tracing::warn!("failed to start UDP tunnel: {err}"),
+                } else {
+                    tracing::warn!(
+                        "UDP parameters received but no resolved target address; cannot start tunnel"
+                    );
                 }
             }
         }
@@ -1400,21 +1448,26 @@ async fn handle_crypt_update(
                     let guard = state.lock().await;
                     guard.udp.clone()
                 } {
-                    match UdpTunnel::start(
-                        udp_options.host.clone(),
-                        udp_options.port,
-                        Arc::new(params),
-                        event_tx.clone(),
-                        #[cfg(feature = "audio")]
-                        playback.clone(),
-                    )
-                    .await
-                    {
-                        Ok(tunnel) => {
-                            tracing::info!("UDP tunnel established");
-                            *udp_tunnel = Some(tunnel);
+                    if let Some(target) = udp_options.target {
+                        match UdpTunnel::start(
+                            target,
+                            Arc::new(params),
+                            event_tx.clone(),
+                            #[cfg(feature = "audio")]
+                            playback.clone(),
+                        )
+                        .await
+                        {
+                            Ok(tunnel) => {
+                                tracing::info!("UDP tunnel established");
+                                *udp_tunnel = Some(tunnel);
+                            }
+                            Err(err) => tracing::warn!("failed to start UDP tunnel: {err}"),
                         }
-                        Err(err) => tracing::warn!("failed to start UDP tunnel: {err}"),
+                    } else {
+                        tracing::warn!(
+                            "UDP resync requested but no resolved target address; cannot start tunnel"
+                        );
                     }
                 }
             }
@@ -1477,6 +1530,28 @@ mod tests {
         assert_eq!(config.tokens, vec!["alpha", "beta"]);
         assert_eq!(config.client_type, ClientType::Regular);
         assert!(config.enable_udp);
+    }
+
+    #[test]
+    fn connection_config_parses_host_and_port() {
+        let config = ConnectionConfig::new("voice.example.net:12345");
+        assert_eq!(config.host, "voice.example.net");
+        assert_eq!(config.port, 12345);
+
+        let rebuilt = ConnectionConfig::builder("voice.example.net:23456").build();
+        assert_eq!(rebuilt.host, "voice.example.net");
+        assert_eq!(rebuilt.port, 23456);
+    }
+
+    #[test]
+    fn connection_config_handles_ipv6_variants() {
+        let ipv6_default = ConnectionConfig::new("2001:db8::1");
+        assert_eq!(ipv6_default.host, "2001:db8::1");
+        assert_eq!(ipv6_default.port, 64738);
+
+        let bracketed = ConnectionConfig::new("[2001:db8::2]:51234");
+        assert_eq!(bracketed.host, "2001:db8::2");
+        assert_eq!(bracketed.port, 51234);
     }
 
     #[test]

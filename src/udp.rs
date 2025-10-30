@@ -40,18 +40,13 @@ enum TunnelCommand {
 impl UdpTunnel {
     /// Spawn a UDP tunnel task which encrypts/decrypts packets using OCB2.
     pub async fn start(
-        host: String,
-        port: u16,
+        target: SocketAddr,
         params: Arc<UdpState>,
         event_tx: tokio::sync::broadcast::Sender<MumbleEvent>,
         #[cfg(feature = "audio")] playback: Option<Arc<AudioPlaybackManager>>,
     ) -> std::io::Result<Self> {
-        let addr: SocketAddr = format!("{}:{}", host, port)
-            .parse()
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
-
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        socket.connect(addr).await?;
+        socket.connect(target).await?;
 
         let mut crypt = CryptStateOcb2::new();
         crypt.set_key(&params.key, &params.client_nonce, &params.server_nonce);
