@@ -459,55 +459,25 @@ impl MumbleConnection {
                     return Err(MumbleError::Rejected(reason));
                 }
                 MumbleMessage::ChannelState(message) => {
-                    {
-                        let state = self.shared_state.lock().await;
-                        state.channels.lock().await.update(&message);
-                    }
+                    apply_channel_state_update(&self.shared_state, &message).await;
                     let _ = self.event_tx.send(MumbleEvent::ChannelState(message));
                 }
                 MumbleMessage::ChannelRemove(message) => {
-                    {
-                        let state = self.shared_state.lock().await;
-                        let channel_id = message.channel_id;
-                        if channel_id != 0 {
-                            state.channels.lock().await.remove(channel_id);
-                        }
-                    }
+                    apply_channel_remove_update(&self.shared_state, &message).await;
                     let _ = self.event_tx.send(MumbleEvent::ChannelRemove(message));
                 }
                 MumbleMessage::UserState(message) => {
                     {
                         let mut state = self.shared_state.lock().await;
-                        if let Some(session) = message.session {
-                            match (&message.name, message.channel_id) {
-                                (Some(name), Some(channel_id)) => {
-                                    tracing::debug!(session, channel_id, user=%name, "UserState: name+channel");
-                                    state.users.insert(session, name.clone());
-                                    state.user_channels.insert(session, channel_id);
-                                }
-                                (Some(name), None) => {
-                                    tracing::debug!(session, user=%name, "UserState: name only");
-                                    state.users.insert(session, name.clone());
-                                    // Heuristic: some servers omit channel_id for users in root.
-                                    // If we don't yet have a mapping for this session, assume root (0).
-                                    state.user_channels.entry(session).or_insert(0);
-                                }
-                                (None, Some(channel_id)) => {
-                                    let existing = state.users.get(&session).cloned();
-                                    tracing::debug!(session, channel_id, known_user=?existing, "UserState: channel only");
-                                    state.user_channels.insert(session, channel_id);
-                                }
-                                (None, None) => {
-                                    tracing::debug!(session, "UserState: no name/channel");
-                                }
-                            }
-                        } else {
-                            tracing::debug!("UserState without session; ignoring");
-                        }
+                        apply_user_state_update(&mut state, &message);
                     }
                     let _ = self.event_tx.send(MumbleEvent::UserState(message));
                 }
                 MumbleMessage::UserRemove(message) => {
+                    {
+                        let mut state = self.shared_state.lock().await;
+                        apply_user_remove_update(&mut state, &message);
+                    }
                     let _ = self.event_tx.send(MumbleEvent::UserRemove(message));
                 }
                 MumbleMessage::TextMessage(message) => {
@@ -1220,10 +1190,12 @@ async fn handle_inbound_message(
             None
         }
         Ok(MumbleMessage::ChannelState(message)) => {
+            apply_channel_state_update(state, &message).await;
             let _ = event_tx.send(MumbleEvent::ChannelState(message));
             None
         }
         Ok(MumbleMessage::ChannelRemove(message)) => {
+            apply_channel_remove_update(state, &message).await;
             let _ = event_tx.send(MumbleEvent::ChannelRemove(message));
             None
         }
@@ -1238,9 +1210,9 @@ async fn handle_inbound_message(
                     actor = ?message.actor,
                     "client: received user state"
                 );
+                apply_user_state_update(&mut guard, &message);
                 if let Some(session) = message.session {
-                    if let Some(channel_id) = message.channel_id {
-                        guard.user_channels.insert(session, channel_id);
+                    if message.channel_id.is_some() {
                         let current = guard.user_channels.get(&session).copied();
                         tracing::info!(
                             conn_session,
@@ -1282,6 +1254,10 @@ async fn handle_inbound_message(
             None
         }
         Ok(MumbleMessage::UserRemove(message)) => {
+            {
+                let mut guard = state.lock().await;
+                apply_user_remove_update(&mut guard, &message);
+            }
             let _ = event_tx.send(MumbleEvent::UserRemove(message));
             None
         }
@@ -1340,6 +1316,60 @@ fn update_udp_state_with_cryptsetup(
         }
     }
     None
+}
+
+async fn apply_channel_state_update(state: &Arc<Mutex<ClientState>>, message: &ChannelState) {
+    let channels = {
+        let guard = state.lock().await;
+        guard.channels.clone()
+    };
+    channels.lock().await.update(message);
+}
+
+async fn apply_channel_remove_update(state: &Arc<Mutex<ClientState>>, message: &ChannelRemove) {
+    if message.channel_id == 0 {
+        return;
+    }
+    let channels = {
+        let guard = state.lock().await;
+        guard.channels.clone()
+    };
+    channels.lock().await.remove(message.channel_id);
+}
+
+fn apply_user_state_update(state: &mut ClientState, message: &UserState) {
+    if let Some(session) = message.session {
+        match (&message.name, message.channel_id) {
+            (Some(name), Some(channel_id)) => {
+                tracing::debug!(session, channel_id, user=%name, "UserState: name+channel");
+                state.users.insert(session, name.clone());
+                state.user_channels.insert(session, channel_id);
+            }
+            (Some(name), None) => {
+                tracing::debug!(session, user=%name, "UserState: name only");
+                state.users.insert(session, name.clone());
+                // Heuristic: some servers omit channel_id for users in root.
+                // If we don't yet have a mapping for this session, assume root (0).
+                state.user_channels.entry(session).or_insert(0);
+            }
+            (None, Some(channel_id)) => {
+                let existing = state.users.get(&session).cloned();
+                tracing::debug!(session, channel_id, known_user=?existing, "UserState: channel only");
+                state.user_channels.insert(session, channel_id);
+            }
+            (None, None) => {
+                tracing::debug!(session, "UserState: no name/channel");
+            }
+        }
+    } else {
+        tracing::debug!("UserState without session; ignoring");
+    }
+}
+
+fn apply_user_remove_update(state: &mut ClientState, message: &UserRemove) {
+    let session = message.session;
+    state.users.remove(&session);
+    state.user_channels.remove(&session);
 }
 
 fn slice_to_array(bytes: &[u8]) -> [u8; 16] {
