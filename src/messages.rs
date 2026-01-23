@@ -9,6 +9,10 @@ use crate::proto::mumble::{
 
 /// Protocol revision tuple (major, minor, patch) advertised to the server.
 pub const PROTOCOL_VERSION: (u32, u32, u32) = (1, 5, 735);
+/// Size of the Mumble TCP framing header in bytes.
+pub const TCP_PREAMBLE_SIZE: usize = 6;
+/// Umurmur-compatible maximum TCP payload size (BUFSIZE 8192 - preamble).
+pub const MAX_TCP_FRAME_SIZE: usize = 8192 - TCP_PREAMBLE_SIZE;
 
 /// High-level message identifier for TCP traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,7 +130,7 @@ impl MessageEnvelope {
         let id = self.kind.as_id();
         let length = self.payload.len() as u32;
 
-        let mut header = [0u8; 6];
+        let mut header = [0u8; TCP_PREAMBLE_SIZE];
         header[..2].copy_from_slice(&id.to_be_bytes());
         header[2..].copy_from_slice(&length.to_be_bytes());
 
@@ -138,7 +142,7 @@ impl MessageEnvelope {
 
     /// Serialize the envelope into a contiguous byte buffer.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(6 + self.payload.len());
+        let mut bytes = Vec::with_capacity(TCP_PREAMBLE_SIZE + self.payload.len());
         bytes.extend_from_slice(&self.kind.as_id().to_be_bytes());
         bytes.extend_from_slice(&(self.payload.len() as u32).to_be_bytes());
         bytes.extend_from_slice(&self.payload);
@@ -151,11 +155,17 @@ pub async fn read_envelope<R>(reader: &mut R) -> Result<MessageEnvelope, std::io
 where
     R: AsyncRead + Unpin,
 {
-    let mut header = [0u8; 6];
+    let mut header = [0u8; TCP_PREAMBLE_SIZE];
     reader.read_exact(&mut header).await?;
 
     let msg_type = u16::from_be_bytes([header[0], header[1]]);
     let length = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
+    if length > MAX_TCP_FRAME_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame too large: {length} bytes"),
+        ));
+    }
 
     let mut payload = vec![0u8; length];
     reader.read_exact(&mut payload).await?;
@@ -351,7 +361,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncWriteExt};
 
     fn golden_version_message() -> Version {
         let mut version = Version::default();
@@ -426,5 +436,19 @@ mod tests {
             MumbleMessage::Version(decoded_version) => assert_eq!(decoded_version, version),
             _ => panic!("expected Version message"),
         }
+    }
+
+    #[tokio::test]
+    async fn read_envelope_rejects_oversize() {
+        let (mut tx, mut rx) = duplex(64);
+        let kind = TcpMessageKind::Version.as_id();
+        let length = (MAX_TCP_FRAME_SIZE + 1) as u32;
+        let mut header = [0u8; TCP_PREAMBLE_SIZE];
+        header[..2].copy_from_slice(&kind.to_be_bytes());
+        header[2..].copy_from_slice(&length.to_be_bytes());
+        tx.write_all(&header).await.unwrap();
+
+        let err = super::read_envelope(&mut rx).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
