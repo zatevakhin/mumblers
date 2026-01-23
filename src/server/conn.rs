@@ -112,7 +112,11 @@ pub async fn handle_connection(
 
         let parsed = MumbleMessage::try_from(env);
         if let Ok(ref msg) = parsed {
-            tracing::debug!(session, kind = message_name(msg), "server: received message");
+            tracing::debug!(
+                session,
+                kind = message_name(msg),
+                "server: received message"
+            );
         }
         match parsed {
             Ok(MumbleMessage::Ping(p)) => {

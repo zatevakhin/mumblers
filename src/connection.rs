@@ -348,11 +348,7 @@ impl MumbleConnection {
         };
 
         tcp_stream.set_nodelay(true)?;
-        self.udp_target = Some(
-            tcp_stream
-                .peer_addr()
-                .map_err(MumbleError::Network)?,
-        );
+        self.udp_target = Some(tcp_stream.peer_addr().map_err(MumbleError::Network)?);
 
         let server_name_str = self
             .config

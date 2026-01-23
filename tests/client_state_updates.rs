@@ -82,7 +82,10 @@ async fn client_state_tracks_user_join_and_remove() {
     );
 
     let state = alice.state().await;
-    assert_eq!(state.users.get(&bob_session).map(String::as_str), Some("bob"));
+    assert_eq!(
+        state.users.get(&bob_session).map(String::as_str),
+        Some("bob")
+    );
     assert_eq!(state.user_channels.get(&bob_session), Some(&0));
 
     drop(bob);
