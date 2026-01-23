@@ -22,3 +22,6 @@ target
 
 # Direnv
 .direnv/
+
+# Audio test files
+*.wav
