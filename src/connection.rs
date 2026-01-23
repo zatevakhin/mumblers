@@ -867,6 +867,7 @@ impl MumbleConnection {
         stream: TlsStream<TcpStream>,
     ) -> Result<(), MumbleError> {
         const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
+        const UDP_RESYNC_INTERVAL: Duration = Duration::from_secs(5);
 
         if let Some(handle) = self.connection_task.take() {
             handle.abort();
@@ -874,6 +875,7 @@ impl MumbleConnection {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (resync_tx, resync_rx) = mpsc::channel(4);
 
         let shared_state = Arc::clone(&self.shared_state);
         let event_tx = self.event_tx.clone();
@@ -938,6 +940,9 @@ impl MumbleConnection {
                 DEFAULT_INTERVAL,
                 shutdown_rx,
                 cmd_rx,
+                resync_rx,
+                resync_tx,
+                UDP_RESYNC_INTERVAL,
                 #[cfg(feature = "audio")]
                 playback,
             )
@@ -998,6 +1003,9 @@ async fn connection_loop(
     interval_duration: Duration,
     mut shutdown: watch::Receiver<bool>,
     mut cmd_rx: mpsc::Receiver<ConnectionCommand>,
+    mut resync_rx: mpsc::Receiver<()>,
+    resync_tx: mpsc::Sender<()>,
+    udp_resync_interval: Duration,
     #[cfg(feature = "audio")] playback: Option<Arc<AudioPlaybackManager>>,
 ) {
     let mut udp_tunnel: Option<UdpTunnel> = None;
@@ -1017,6 +1025,8 @@ async fn connection_loop(
                 event_tx.clone(),
                 #[cfg(feature = "audio")]
                 playback.clone(),
+                resync_tx.clone(),
+                udp_resync_interval,
             )
             .await
             {
@@ -1061,6 +1071,13 @@ async fn connection_loop(
                     None => break,
                 }
             }
+            resync = resync_rx.recv() => {
+                if resync.is_some() {
+                    if let Err(err) = send_cryptsetup_request(&mut stream).await {
+                        tracing::warn!("failed to request UDP resync: {err}");
+                    }
+                }
+            }
             result = read_envelope(&mut stream) => {
                 match result {
                     Ok(envelope) => {
@@ -1083,6 +1100,8 @@ async fn connection_loop(
                                 &udp_options,
                                 &mut udp_tunnel,
                                 &mut stream,
+                                &resync_tx,
+                                udp_resync_interval,
                                 #[cfg(feature = "audio")]
                                 playback.clone(),
                             )
@@ -1421,6 +1440,11 @@ async fn send_udp_state_message(
     Ok(())
 }
 
+async fn send_cryptsetup_request(stream: &mut TlsStream<TcpStream>) -> Result<(), MumbleError> {
+    let setup = CryptSetup::default();
+    send_message(stream, TcpMessageKind::CryptSetup, &setup).await
+}
+
 async fn handle_crypt_update(
     update: CryptUpdate,
     state: &Arc<Mutex<ClientState>>,
@@ -1428,6 +1452,8 @@ async fn handle_crypt_update(
     udp_options: &UdpOptions,
     udp_tunnel: &mut Option<UdpTunnel>,
     stream: &mut TlsStream<TcpStream>,
+    resync_tx: &mpsc::Sender<()>,
+    udp_resync_interval: Duration,
     #[cfg(feature = "audio")] playback: Option<Arc<AudioPlaybackManager>>,
 ) {
     if !udp_options.enable {
@@ -1449,6 +1475,8 @@ async fn handle_crypt_update(
                         event_tx.clone(),
                         #[cfg(feature = "audio")]
                         playback.clone(),
+                        resync_tx.clone(),
+                        udp_resync_interval,
                     )
                     .await
                     {
@@ -1481,6 +1509,8 @@ async fn handle_crypt_update(
                             event_tx.clone(),
                             #[cfg(feature = "audio")]
                             playback.clone(),
+                            resync_tx.clone(),
+                            udp_resync_interval,
                         )
                         .await
                         {

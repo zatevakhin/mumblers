@@ -1,6 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -23,6 +24,7 @@ use rand::RngCore;
 const CONN_QUEUE_CAPACITY: usize = 256;
 const UDP_MSG_TYPE_AUDIO: u8 = 0;
 const UDP_MSG_TYPE_PING: u8 = 1;
+const UDP_RESYNC_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct HandshakeRejected;
@@ -871,18 +873,23 @@ async fn decrypt_datagram(
 ) -> Option<(super::state::SessionId, Vec<u8>, VoiceMetrics)> {
     if let Some(session) = state.session_by_udp_addr(&addr).await {
         if let Some(crypt_arc) = state.crypt_state(session).await {
-            let mut guard = crypt_arc.lock().await;
-            match guard.decrypt(data) {
+            let (result, last_good, metrics) = {
+                let mut guard = crypt_arc.lock().await;
+                let result = guard.decrypt(data);
+                let metrics = VoiceMetrics {
+                    good: guard.ui_good,
+                    late: guard.ui_late,
+                    lost: guard.ui_lost,
+                };
+                (result, guard.t_last_good, metrics)
+            };
+            match result {
                 Ok(plain) => {
-                    let metrics = VoiceMetrics {
-                        good: guard.ui_good,
-                        late: guard.ui_late,
-                        lost: guard.ui_lost,
-                    };
                     return Some((session, plain, metrics));
                 }
                 Err(err) => {
                     tracing::debug!(session, error=?err, %addr, "server: udp decrypt failed");
+                    maybe_request_resync(state, session, last_good).await;
                     return None;
                 }
             }
@@ -915,6 +922,81 @@ async fn decrypt_datagram(
         }
     }
     None
+}
+
+async fn maybe_request_resync(
+    state: &ServerState,
+    session: super::state::SessionId,
+    last_good: Option<Instant>,
+) {
+    let now = Instant::now();
+    let stale = last_good
+        .map(|good| now.duration_since(good) > UDP_RESYNC_INTERVAL)
+        .unwrap_or(true);
+    if !stale {
+        return;
+    }
+    if !state
+        .mark_resync_request(session, now, UDP_RESYNC_INTERVAL)
+        .await
+    {
+        return;
+    }
+    if let Some(crypt) = state.get_crypt(session).await {
+        let mut setup = CryptSetup::default();
+        setup.server_nonce = Some(crypt.server_nonce.to_vec());
+        let sent = state
+            .send_to(session, MumbleMessage::CryptSetup(setup))
+            .await;
+        if !sent {
+            tracing::debug!(session, "server: failed to send UDP resync");
+        } else {
+            tracing::info!(session, "server: requested UDP resync");
+        }
+    }
+}
+
+#[cfg(test)]
+mod udp_resync_tests {
+    use super::*;
+    use crate::server::state::UdpCrypt;
+    use crate::server::ServerConfig;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn udp_decrypt_failure_requests_resync() {
+        let cfg = ServerConfig::default();
+        let state = ServerState::new(cfg);
+        let session = state.alloc_session().await;
+        let (tx, mut rx) = mpsc::channel(1);
+        state.register_conn(session, tx).await;
+
+        let crypt = UdpCrypt {
+            key: [1u8; 16],
+            server_nonce: [2u8; 16],
+            client_nonce: [3u8; 16],
+        };
+        state.set_crypt(session, crypt).await;
+        let addr: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+        state.set_udp_pair(session, addr).await;
+
+        if let Some(arc) = state.crypt_state(session).await {
+            let mut guard = arc.lock().await;
+            guard.t_last_good = Some(Instant::now() - UDP_RESYNC_INTERVAL - Duration::from_secs(1));
+        }
+
+        let data = vec![0u8; 8];
+        let _ = decrypt_datagram(&state, &data, addr).await;
+
+        match rx.recv().await.expect("resync message") {
+            MumbleMessage::CryptSetup(setup) => {
+                assert!(setup.server_nonce.is_some());
+                assert!(setup.key.is_none());
+                assert!(setup.client_nonce.is_none());
+            }
+            other => panic!("unexpected message: {:?}", other),
+        }
+    }
 }
 
 async fn process_udp_plain(

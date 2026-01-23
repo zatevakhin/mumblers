@@ -56,7 +56,7 @@ impl CryptStateOcb2 {
             ui_good: 0,
             ui_late: 0,
             ui_lost: 0,
-            t_last_good: None,
+            t_last_good: Some(Instant::now()),
         }
     }
 
@@ -66,6 +66,7 @@ impl CryptStateOcb2 {
         OsRng.fill_bytes(&mut self.decrypt_iv);
         self.aes = Aes128::new(GenericArray::from_slice(&self.raw_key));
         self.decrypt_history = [0; 0x100];
+        self.t_last_good = Some(Instant::now());
     }
 
     pub fn set_key(&mut self, key: &[u8], encrypt_iv: &[u8], decrypt_iv: &[u8]) {
@@ -77,6 +78,7 @@ impl CryptStateOcb2 {
         self.decrypt_iv.copy_from_slice(decrypt_iv);
         self.aes = Aes128::new(GenericArray::from_slice(&self.raw_key));
         self.decrypt_history = [0; 0x100];
+        self.t_last_good = Some(Instant::now());
     }
 
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptError> {

@@ -85,6 +85,7 @@ struct InnerState {
     udp_pair_by_addr: HashMap<SocketAddr, SessionId>,
     crypt_states: HashMap<SessionId, Arc<tokio::sync::Mutex<CryptStateOcb2>>>,
     voice_stats: HashMap<SessionId, VoiceStats>,
+    last_resync_request: HashMap<SessionId, Instant>,
     channels: HashMap<u32, ChannelInfo>,
     channel_name_idx: HashMap<String, u32>,
     channel_members: HashMap<u32, HashSet<SessionId>>,
@@ -112,6 +113,7 @@ impl ServerState {
                 udp_pair_by_addr: HashMap::new(),
                 crypt_states: HashMap::new(),
                 voice_stats: HashMap::new(),
+                last_resync_request: HashMap::new(),
                 channels,
                 channel_name_idx: name_idx,
                 channel_members: members,
@@ -207,6 +209,7 @@ impl ServerState {
         }
         g.crypt_states.remove(&session);
         g.voice_stats.remove(&session);
+        g.last_resync_request.remove(&session);
     }
 
     pub async fn list_users(&self) -> Vec<UserInfo> {
@@ -464,6 +467,22 @@ impl ServerState {
         stats.good = metrics.good;
         stats.late = metrics.late;
         stats.lost = metrics.lost;
+    }
+
+    pub async fn mark_resync_request(
+        &self,
+        session: SessionId,
+        now: Instant,
+        interval: std::time::Duration,
+    ) -> bool {
+        let mut g = self.inner.write().await;
+        match g.last_resync_request.get(&session) {
+            Some(prev) if now.duration_since(*prev) < interval => false,
+            _ => {
+                g.last_resync_request.insert(session, now);
+                true
+            }
+        }
     }
 }
 

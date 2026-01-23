@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use prost::Message;
 use tokio::net::UdpSocket;
@@ -44,6 +45,8 @@ impl UdpTunnel {
         params: Arc<UdpState>,
         event_tx: tokio::sync::broadcast::Sender<MumbleEvent>,
         #[cfg(feature = "audio")] playback: Option<Arc<AudioPlaybackManager>>,
+        resync_tx: mpsc::Sender<()>,
+        resync_interval: Duration,
     ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
         socket.connect(target).await?;
@@ -61,6 +64,7 @@ impl UdpTunnel {
         let task = tokio::spawn(async move {
             let mut ticker = interval(UDP_PING_INTERVAL);
             let mut buffer = vec![0u8; UDP_BUFFER_SIZE];
+            let mut last_resync_request: Option<Instant> = None;
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
@@ -88,6 +92,22 @@ impl UdpTunnel {
                                     }
                                     Err(err) => {
                                         tracing::debug!("dropping UDP packet: {err:?}");
+                                        let now = Instant::now();
+                                        let last_good = {
+                                            let guard = crypt_clone.lock().await;
+                                            guard.t_last_good
+                                        };
+                                        let stale = last_good
+                                            .map(|good| now.duration_since(good) > resync_interval)
+                                            .unwrap_or(true);
+                                        let can_request = last_resync_request
+                                            .map(|prev| now.duration_since(prev) > resync_interval)
+                                            .unwrap_or(true);
+                                        if stale && can_request {
+                                            if resync_tx.try_send(()).is_ok() {
+                                                last_resync_request = Some(now);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -277,4 +297,61 @@ fn current_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod resync_tests {
+    use super::*;
+    use tokio::time::{sleep, timeout, Duration};
+
+    fn sample_packet() -> VoicePacket {
+        VoicePacket {
+            header: crate::audio::AudioHeader::Target(0),
+            sender_session: None,
+            frame_number: 1,
+            opus_data: vec![1, 2, 3],
+            positional_data: None,
+            volume_adjustment: None,
+            is_terminator: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn decrypt_failure_triggers_resync_request() {
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+
+        let params = Arc::new(UdpState {
+            key: [1u8; 16],
+            client_nonce: [2u8; 16],
+            server_nonce: [3u8; 16],
+        });
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(4);
+        let (resync_tx, mut resync_rx) = mpsc::channel(1);
+        let tunnel = UdpTunnel::start(
+            server_addr,
+            params,
+            event_tx,
+            #[cfg(feature = "audio")]
+            None,
+            resync_tx,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+
+        tunnel.send_audio(sample_packet()).await.unwrap();
+
+        let mut buf = [0u8; 1500];
+        let (_, client_addr) = server_socket.recv_from(&mut buf).await.unwrap();
+
+        sleep(Duration::from_millis(2)).await;
+        server_socket.send_to(&[0u8; 8], client_addr).await.unwrap();
+
+        timeout(Duration::from_secs(1), resync_rx.recv())
+            .await
+            .expect("resync signal")
+            .expect("resync message");
+        drop(tunnel);
+    }
 }
