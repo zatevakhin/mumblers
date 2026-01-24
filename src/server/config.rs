@@ -1,6 +1,6 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChannelConfig {
     pub name: String,
     #[serde(default)]
@@ -17,7 +17,7 @@ pub struct ChannelConfig {
     pub silent: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
     pub bind_host: String,
     pub bind_port: u16,

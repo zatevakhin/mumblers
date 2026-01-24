@@ -593,7 +593,7 @@ async fn spawn_writer_task(
         while let Some(msg) = rx.recv().await {
             match &msg {
                 MumbleMessage::UserState(us) => {
-                    tracing::info!(
+                    tracing::debug!(
                         session,
                         target_session = ?us.session,
                         channel = ?us.channel_id,
@@ -602,7 +602,7 @@ async fn spawn_writer_task(
                     );
                 }
                 MumbleMessage::TextMessage(_) => {
-                    tracing::info!(session, kind=%message_name(&msg), "server: sending message");
+                    tracing::debug!(session, kind=%message_name(&msg), "server: sending message");
                 }
                 _ => {
                     tracing::debug!(session, kind=%message_name(&msg), "server: sending message");
@@ -626,7 +626,7 @@ async fn spawn_writer_task(
                 );
                 break;
             }
-            tracing::info!(session, kind = %message_name(&msg), "server: message flushed to wire");
+            tracing::debug!(session, kind = %message_name(&msg), "server: message flushed to wire");
         }
         reg_state.unregister_conn(session).await;
     });

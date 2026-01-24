@@ -25,3 +25,7 @@ target
 
 # Audio test files
 *.wav
+
+# Server stuff
+certs/*
+mumblers.toml

@@ -13,7 +13,7 @@ bytes = "1"
 prost = "0.14"
 prost-types = "0.14"
 thiserror = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "macros", "sync", "signal"] }
 tokio-rustls = "0.25"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -24,15 +24,15 @@ opus = { version = "0.3", optional = true }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 rustls-pemfile = "2"
+clap = { version = "4", features = ["derive"] }
+rcgen = "0.12"
 
 [build-dependencies]
 prost-build = "0.14"
 protoc-bin-vendored = "3.1"
 
 [dev-dependencies]
-clap = { version = "4", features = ["derive"] }
 hound = "3"
-rcgen = "0.12"
 tokio-rustls = "0.25"
 rustls = "0.23"
 
