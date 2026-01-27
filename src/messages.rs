@@ -1,4 +1,6 @@
 use prost::{EncodeError, Message};
+use std::io;
+
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -13,6 +15,101 @@ pub const PROTOCOL_VERSION: (u32, u32, u32) = (1, 5, 735);
 pub const TCP_PREAMBLE_SIZE: usize = 6;
 /// Umurmur-compatible maximum TCP payload size (BUFSIZE 8192 - preamble).
 pub const MAX_TCP_FRAME_SIZE: usize = 8192 - TCP_PREAMBLE_SIZE;
+
+/// Stateful TCP frame decoder (umurmur-style).
+///
+/// This decoder retains partial reads across `.read_next()` calls, preventing framing
+/// desynchronization when frames arrive fragmented.
+#[derive(Debug)]
+pub struct TcpFrameDecoder {
+    rxbuf: [u8; 8192],
+    rxcount: usize,
+    msgsize: Option<usize>,
+}
+
+impl Default for TcpFrameDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TcpFrameDecoder {
+    pub fn new() -> Self {
+        Self {
+            rxbuf: [0u8; 8192],
+            rxcount: 0,
+            msgsize: None,
+        }
+    }
+
+    pub async fn read_next<R>(&mut self, reader: &mut R) -> Result<MessageEnvelope, io::Error>
+    where
+        R: AsyncRead + Unpin,
+    {
+        loop {
+            let target = match self.msgsize {
+                None => TCP_PREAMBLE_SIZE,
+                Some(len) => TCP_PREAMBLE_SIZE + len,
+            };
+
+            if self.rxcount < target {
+                let n = reader.read(&mut self.rxbuf[self.rxcount..target]).await?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "unexpected EOF while reading Mumble frame",
+                    ));
+                }
+                self.rxcount += n;
+            }
+
+            if self.msgsize.is_none() && self.rxcount >= TCP_PREAMBLE_SIZE {
+                let msg_type = u16::from_be_bytes([self.rxbuf[0], self.rxbuf[1]]);
+                let length = u32::from_be_bytes([
+                    self.rxbuf[2],
+                    self.rxbuf[3],
+                    self.rxbuf[4],
+                    self.rxbuf[5],
+                ]) as usize;
+
+                if length > MAX_TCP_FRAME_SIZE {
+                    let header = [
+                        self.rxbuf[0],
+                        self.rxbuf[1],
+                        self.rxbuf[2],
+                        self.rxbuf[3],
+                        self.rxbuf[4],
+                        self.rxbuf[5],
+                    ];
+                    self.rxcount = 0;
+                    self.msgsize = None;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "frame too large: {length} bytes (type={msg_type}, header={:02x?})",
+                            header
+                        ),
+                    ));
+                }
+
+                self.msgsize = Some(length);
+            }
+
+            if let Some(len) = self.msgsize {
+                if self.rxcount >= TCP_PREAMBLE_SIZE + len {
+                    let msg_type = u16::from_be_bytes([self.rxbuf[0], self.rxbuf[1]]);
+                    let payload = self.rxbuf[TCP_PREAMBLE_SIZE..TCP_PREAMBLE_SIZE + len].to_vec();
+                    self.rxcount = 0;
+                    self.msgsize = None;
+                    return Ok(MessageEnvelope::new(
+                        TcpMessageKind::from_id(msg_type),
+                        payload,
+                    ));
+                }
+            }
+        }
+    }
+}
 
 /// High-level message identifier for TCP traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

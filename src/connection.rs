@@ -7,6 +7,7 @@ use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
 use rand::{rngs::OsRng, RngCore};
+use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
@@ -24,7 +25,8 @@ use crate::audio::AudioPlaybackManager;
 use crate::audio::VoicePacket;
 use crate::error::MumbleError;
 use crate::messages::{
-    read_envelope, MessageDecodeError, MessageEnvelope, MumbleMessage, TcpMessageKind,
+    read_envelope, MessageDecodeError, MessageEnvelope, MumbleMessage, TcpFrameDecoder,
+    TcpMessageKind,
 };
 use crate::proto::mumble::{
     reject::RejectType, Authenticate, ChannelRemove, ChannelState, CodecVersion, CryptSetup,
@@ -869,6 +871,9 @@ impl MumbleConnection {
         const DEFAULT_INTERVAL: Duration = Duration::from_secs(10);
         const UDP_RESYNC_INTERVAL: Duration = Duration::from_secs(5);
 
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(true);
+        }
         if let Some(handle) = self.connection_task.take() {
             handle.abort();
         }
@@ -996,7 +1001,7 @@ fn apply_latency_metrics(state: &mut ClientState, ping: &crate::proto::mumble::P
 }
 
 async fn connection_loop(
-    mut stream: TlsStream<TcpStream>,
+    stream: TlsStream<TcpStream>,
     state: Arc<Mutex<ClientState>>,
     event_tx: broadcast::Sender<MumbleEvent>,
     udp_options: UdpOptions,
@@ -1008,6 +1013,33 @@ async fn connection_loop(
     udp_resync_interval: Duration,
     #[cfg(feature = "audio")] playback: Option<Arc<AudioPlaybackManager>>,
 ) {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
+    let mut reader_shutdown = shutdown.clone();
+
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<Result<MessageEnvelope, io::Error>>(64);
+    let reader_task = tokio::spawn(async move {
+        let mut decoder = TcpFrameDecoder::new();
+        loop {
+            tokio::select! {
+                changed = reader_shutdown.changed() => {
+                    if changed.is_ok() && *reader_shutdown.borrow() {
+                        break;
+                    }
+                }
+                res = decoder.read_next(&mut reader) => {
+                    let is_err = res.is_err();
+                    if inbound_tx.send(res).await.is_err() {
+                        break;
+                    }
+                    if is_err {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
     let mut udp_tunnel: Option<UdpTunnel> = None;
 
     if udp_options.enable {
@@ -1043,14 +1075,14 @@ async fn connection_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                if send_ping_internal(&mut stream, &state).await.is_err() {
+                if send_ping_internal(&mut writer, &state).await.is_err() {
                     break;
                 }
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(ConnectionCommand::SendPing) => {
-                        if send_ping_internal(&mut stream, &state).await.is_err() {
+                        if send_ping_internal(&mut writer, &state).await.is_err() {
                             break;
                         }
                     }
@@ -1064,7 +1096,7 @@ async fn connection_loop(
                          }
                      }
                      Some(ConnectionCommand::SendMessage(message)) => {
-                         if let Err(err) = crate::messages::write_message(&mut stream, &message).await {
+                         if let Err(err) = crate::messages::write_message(&mut writer, &message).await {
                              tracing::warn!("failed to send message: {err}");
                          }
                      }
@@ -1073,14 +1105,14 @@ async fn connection_loop(
             }
             resync = resync_rx.recv() => {
                 if resync.is_some() {
-                    if let Err(err) = send_cryptsetup_request(&mut stream).await {
+                    if let Err(err) = send_cryptsetup_request(&mut writer).await {
                         tracing::warn!("failed to request UDP resync: {err}");
                     }
                 }
             }
-            result = read_envelope(&mut stream) => {
-                match result {
-                    Ok(envelope) => {
+            inbound = inbound_rx.recv() => {
+                match inbound {
+                    Some(Ok(envelope)) => {
                         let conn_session = {
                             let guard = state.lock().await;
                             guard.session_id
@@ -1099,7 +1131,7 @@ async fn connection_loop(
                                 &event_tx,
                                 &udp_options,
                                 &mut udp_tunnel,
-                                &mut stream,
+                                &mut writer,
                                 &resync_tx,
                                 udp_resync_interval,
                                 #[cfg(feature = "audio")]
@@ -1108,7 +1140,7 @@ async fn connection_loop(
                             .await;
                         }
                     }
-                    Err(err) => {
+                    Some(Err(err)) => {
                         let conn_session = {
                             let guard = state.lock().await;
                             guard.session_id
@@ -1120,6 +1152,7 @@ async fn connection_loop(
                         );
                         break;
                     }
+                    None => break,
                 }
             }
             changed = shutdown.changed() => {
@@ -1129,12 +1162,14 @@ async fn connection_loop(
             }
         }
     }
+
+    reader_task.abort();
 }
 
-async fn send_ping_internal(
-    stream: &mut TlsStream<TcpStream>,
-    state: &Arc<Mutex<ClientState>>,
-) -> Result<(), ()> {
+async fn send_ping_internal<W>(writer: &mut W, state: &Arc<Mutex<ClientState>>) -> Result<(), ()>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut guard = state.lock().await;
     let mut ping = crate::proto::mumble::Ping::default();
     ping.timestamp = Some(current_millis());
@@ -1144,7 +1179,7 @@ async fn send_ping_internal(
     drop(guard);
 
     let message = MumbleMessage::Ping(ping);
-    crate::messages::write_message(stream, &message)
+    crate::messages::write_message(writer, &message)
         .await
         .map_err(|err| {
             tracing::warn!("failed to send ping: {err}");
@@ -1415,12 +1450,15 @@ async fn ensure_udp_state(state: &Arc<Mutex<ClientState>>) -> UdpState {
     generated
 }
 
-async fn send_udp_state_message(
-    stream: &mut TlsStream<TcpStream>,
+async fn send_udp_state_message<W>(
+    writer: &mut W,
     state: &Arc<Mutex<ClientState>>,
     include_key: bool,
     include_client: bool,
-) -> Result<(), MumbleError> {
+) -> Result<(), MumbleError>
+where
+    W: AsyncWrite + Unpin,
+{
     let params = {
         let guard = state.lock().await;
         guard.udp.clone()
@@ -1434,15 +1472,18 @@ async fn send_udp_state_message(
         if include_client {
             setup.client_nonce = Some(params.client_nonce.to_vec());
         }
-        send_message(stream, TcpMessageKind::CryptSetup, &setup).await?;
+        send_message(writer, TcpMessageKind::CryptSetup, &setup).await?;
     }
 
     Ok(())
 }
 
-async fn send_cryptsetup_request(stream: &mut TlsStream<TcpStream>) -> Result<(), MumbleError> {
+async fn send_cryptsetup_request<W>(writer: &mut W) -> Result<(), MumbleError>
+where
+    W: AsyncWrite + Unpin,
+{
     let setup = CryptSetup::default();
-    send_message(stream, TcpMessageKind::CryptSetup, &setup).await
+    send_message(writer, TcpMessageKind::CryptSetup, &setup).await
 }
 
 async fn handle_crypt_update(
@@ -1451,7 +1492,7 @@ async fn handle_crypt_update(
     event_tx: &broadcast::Sender<MumbleEvent>,
     udp_options: &UdpOptions,
     udp_tunnel: &mut Option<UdpTunnel>,
-    stream: &mut TlsStream<TcpStream>,
+    writer: &mut (impl AsyncWrite + Unpin),
     resync_tx: &mpsc::Sender<()>,
     udp_resync_interval: Duration,
     #[cfg(feature = "audio")] playback: Option<Arc<AudioPlaybackManager>>,
@@ -1534,7 +1575,7 @@ async fn handle_crypt_update(
                 }
             }
 
-            if let Err(err) = send_udp_state_message(stream, state, false, true).await {
+            if let Err(err) = send_udp_state_message(writer, state, false, true).await {
                 tracing::warn!("failed to acknowledge UDP resync: {err}");
             }
         }
@@ -1767,15 +1808,19 @@ async fn send_codec_version(stream: &mut TlsStream<TcpStream>) -> Result<(), Mum
     send_message(stream, TcpMessageKind::CodecVersion, &message).await
 }
 
-async fn send_message<M: prost::Message>(
-    stream: &mut TlsStream<TcpStream>,
+async fn send_message<W, M>(
+    writer: &mut W,
     kind: TcpMessageKind,
     message: &M,
-) -> Result<(), MumbleError> {
+) -> Result<(), MumbleError>
+where
+    W: AsyncWrite + Unpin,
+    M: prost::Message,
+{
     let envelope = MessageEnvelope::try_from_message(kind, message)
         .map_err(|e| MumbleError::Protocol(format!("encode {kind:?} failed: {e}")))?;
     envelope
-        .write_to(stream)
+        .write_to(writer)
         .await
         .map_err(MumbleError::Network)
 }

@@ -58,12 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 async fn serve(config_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_tracing();
-    let config_str = fs::read_to_string(config_path).map_err(|err| {
-        format!(
-            "failed to read config at {}: {err}",
-            config_path.display()
-        )
-    })?;
+    let config_str = fs::read_to_string(config_path)
+        .map_err(|err| format!("failed to read config at {}: {err}", config_path.display()))?;
     let cfg: ServerConfig = toml::from_str(&config_str)?;
 
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
@@ -193,9 +189,7 @@ fn build_tls_config(
     let mut key_cursor = std::io::Cursor::new(&key_pem);
     let keys_iter = rustls_pemfile::pkcs8_private_keys(&mut key_cursor);
     let mut keys: Vec<_> = keys_iter.collect::<Result<_, _>>()?;
-    let key = keys
-        .pop()
-        .ok_or("no private keys found in key file")?;
+    let key = keys.pop().ok_or("no private keys found in key file")?;
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(key.clone_key());
 
     let config = rustls::ServerConfig::builder()
@@ -237,7 +231,5 @@ fn write_file_if_changed(path: &Path, contents: &[u8]) -> io::Result<()> {
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
