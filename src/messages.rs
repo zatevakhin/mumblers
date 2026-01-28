@@ -6,7 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proto::mumble::{
     Authenticate, ChannelRemove, ChannelState, CodecVersion, CryptSetup, PermissionDenied, Ping,
-    Reject, ServerSync, TextMessage, UserRemove, UserState, Version,
+    Reject, ServerSync, TextMessage, UdpTunnel, UserRemove, UserState, Version,
 };
 
 /// Protocol revision tuple (major, minor, patch) advertised to the server.
@@ -116,6 +116,8 @@ impl TcpFrameDecoder {
 pub enum TcpMessageKind {
     /// Server's initial Version message.
     Version,
+    /// UDP voice packets tunneled over TCP.
+    UdpTunnel,
     /// Authentication payload containing username, password, and tokens.
     Authenticate,
     /// Server rejected the connection attempt.
@@ -149,6 +151,7 @@ impl TcpMessageKind {
     pub fn from_id(value: u16) -> Self {
         match value {
             0 => TcpMessageKind::Version,
+            1 => TcpMessageKind::UdpTunnel,
             2 => TcpMessageKind::Authenticate,
             3 => TcpMessageKind::Ping,
             4 => TcpMessageKind::Reject,
@@ -169,6 +172,7 @@ impl TcpMessageKind {
     pub fn as_id(self) -> u16 {
         match self {
             TcpMessageKind::Version => 0,
+            TcpMessageKind::UdpTunnel => 1,
             TcpMessageKind::Authenticate => 2,
             TcpMessageKind::Ping => 3,
             TcpMessageKind::Reject => 4,
@@ -277,6 +281,11 @@ where
 #[derive(Debug, Clone)]
 pub enum MumbleMessage {
     Version(Version),
+    /// Raw UDP datagram bytes tunneled over the TCP connection.
+    ///
+    /// In practice, this is the same ciphertext datagram the client would send over UDP:
+    /// `ivbyte || tag(3) || encrypted_payload(...)`.
+    UdpTunnel(Vec<u8>),
     Authenticate(Authenticate),
     Reject(Reject),
     ServerSync(ServerSync),
@@ -298,6 +307,7 @@ impl MumbleMessage {
     pub fn kind(&self) -> TcpMessageKind {
         match self {
             MumbleMessage::Version(_) => TcpMessageKind::Version,
+            MumbleMessage::UdpTunnel(_) => TcpMessageKind::UdpTunnel,
             MumbleMessage::Authenticate(_) => TcpMessageKind::Authenticate,
             MumbleMessage::Reject(_) => TcpMessageKind::Reject,
             MumbleMessage::ServerSync(_) => TcpMessageKind::ServerSync,
@@ -318,6 +328,8 @@ impl MumbleMessage {
     pub fn encode(&self) -> Result<MessageEnvelope, EncodeError> {
         match self {
             MumbleMessage::Version(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
+            // UDPTunnel is sent as a raw payload in practice.
+            MumbleMessage::UdpTunnel(bytes) => Ok(MessageEnvelope::new(self.kind(), bytes.clone())),
             MumbleMessage::Authenticate(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
             MumbleMessage::Reject(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
             MumbleMessage::ServerSync(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
@@ -364,6 +376,25 @@ impl TryFrom<MessageEnvelope> for MumbleMessage {
                     kind: TcpMessageKind::Version,
                     source,
                 })?,
+            TcpMessageKind::UdpTunnel => {
+                // Support both:
+                // - Raw tunneled bytes as the TCP payload (umurmur-style)
+                // - Protobuf-wrapped UDPTunnel { packet: bytes }
+                //
+                // The protobuf message is trivial. We only unwrap if re-encoding matches the
+                // original payload to avoid false positives when the raw payload happens to
+                // start with the same tag byte.
+                let payload = envelope.payload;
+                if payload.first().copied() == Some(0x0a) {
+                    if let Ok(tunnel) = UdpTunnel::decode(payload.as_slice()) {
+                        let mut check = Vec::new();
+                        if tunnel.encode(&mut check).is_ok() && check == payload {
+                            return Ok(MumbleMessage::UdpTunnel(tunnel.packet));
+                        }
+                    }
+                }
+                MumbleMessage::UdpTunnel(payload)
+            }
             TcpMessageKind::Authenticate => Authenticate::decode(envelope.payload.as_slice())
                 .map(MumbleMessage::Authenticate)
                 .map_err(|source| MessageDecodeError::Decode {

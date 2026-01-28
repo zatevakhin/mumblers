@@ -7,6 +7,7 @@ use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
 use rand::{rngs::OsRng, RngCore};
+use prost::Message;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
@@ -28,6 +29,7 @@ use crate::messages::{
     read_envelope, MessageDecodeError, MessageEnvelope, MumbleMessage, TcpFrameDecoder,
     TcpMessageKind,
 };
+use crate::crypto::ocb2::CryptStateOcb2;
 use crate::proto::mumble::{
     reject::RejectType, Authenticate, ChannelRemove, ChannelState, CodecVersion, CryptSetup,
     PermissionDenied, TextMessage, UserRemove, UserState, Version,
@@ -486,6 +488,7 @@ impl MumbleConnection {
                 }
                 MumbleMessage::Authenticate(_)
                 | MumbleMessage::Ping(_)
+                | MumbleMessage::UdpTunnel(_)
                 | MumbleMessage::Unknown(_) => {
                     // Ignore other handshake-time messages for now.
                 }
@@ -1041,6 +1044,7 @@ async fn connection_loop(
     });
 
     let mut udp_tunnel: Option<UdpTunnel> = None;
+    let mut tcp_tunnel_crypt: Option<CryptStateOcb2> = None;
 
     if udp_options.enable {
         if udp_options.target.is_none() {
@@ -1122,8 +1126,13 @@ async fn connection_loop(
                             kind = ?envelope.kind,
                             "client: envelope received"
                         );
-                        if let Some(update) =
-                            handle_inbound_message(envelope.clone(), &state, &event_tx).await
+                        if let Some(update) = handle_inbound_message(
+                            envelope.clone(),
+                            &state,
+                            &event_tx,
+                            &mut tcp_tunnel_crypt,
+                        )
+                        .await
                         {
                             handle_crypt_update(
                                 update,
@@ -1131,6 +1140,7 @@ async fn connection_loop(
                                 &event_tx,
                                 &udp_options,
                                 &mut udp_tunnel,
+                                &mut tcp_tunnel_crypt,
                                 &mut writer,
                                 &resync_tx,
                                 udp_resync_interval,
@@ -1190,6 +1200,7 @@ async fn handle_inbound_message(
     envelope: MessageEnvelope,
     state: &Arc<Mutex<ClientState>>,
     event_tx: &broadcast::Sender<MumbleEvent>,
+    tcp_tunnel_crypt: &mut Option<CryptStateOcb2>,
 ) -> Option<CryptUpdate> {
     match MumbleMessage::try_from(envelope.clone()) {
         Ok(MumbleMessage::CryptSetup(setup)) => {
@@ -1319,6 +1330,14 @@ async fn handle_inbound_message(
             let _ = event_tx.send(MumbleEvent::PermissionDenied(message));
             None
         }
+        Ok(MumbleMessage::UdpTunnel(payload)) => {
+            if let Err(err) =
+                handle_tunneled_udp_payload(&payload, state, tcp_tunnel_crypt, event_tx).await
+            {
+                tracing::warn!("failed to handle tunneled udp payload: {err}");
+            }
+            None
+        }
         Ok(other) => {
             let _ = event_tx.send(MumbleEvent::Other(other));
             None
@@ -1329,6 +1348,86 @@ async fn handle_inbound_message(
             None
         }
     }
+}
+
+async fn handle_tunneled_udp_payload(
+    ciphertext: &[u8],
+    state: &Arc<Mutex<ClientState>>,
+    tcp_tunnel_crypt: &mut Option<CryptStateOcb2>,
+    event_tx: &broadcast::Sender<MumbleEvent>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if ciphertext.is_empty() {
+        return Ok(());
+    }
+
+    // Real servers commonly tunnel plaintext MumbleUDP frames over TCP (TLS already provides
+    // transport security). Some implementations tunnel the encrypted UDP datagram.
+    // Support both.
+    match ciphertext[0] {
+        0 => {
+            if let Ok(audio) = crate::proto::mumble_udp::Audio::decode(&ciphertext[1..]) {
+                if let Some(packet) = VoicePacket::from_proto(&audio) {
+                    let _ = event_tx.send(MumbleEvent::UdpAudio(packet));
+                }
+                return Ok(());
+            }
+        }
+        1 => {
+            if let Ok(ping) = crate::proto::mumble_udp::Ping::decode(&ciphertext[1..]) {
+                let _ = event_tx.send(MumbleEvent::UdpPing(ping));
+                return Ok(());
+            }
+        }
+        _ => {}
+    }
+
+    if tcp_tunnel_crypt.is_none() {
+        let params = {
+            let guard = state.lock().await;
+            guard.udp.clone()
+        };
+        if let Some(params) = params {
+            let mut crypt = CryptStateOcb2::new();
+            crypt.set_key(&params.key, &params.client_nonce, &params.server_nonce);
+            *tcp_tunnel_crypt = Some(crypt);
+        } else {
+            // No crypt state yet; ignore tunneled packets.
+            return Ok(());
+        }
+    }
+
+    let plain = match tcp_tunnel_crypt
+        .as_mut()
+        .expect("tunnel crypt initialized")
+        .decrypt(ciphertext)
+    {
+        Ok(plain) => plain,
+        Err(err) => {
+            tracing::debug!(error=?err, "dropping tunneled udp packet");
+            return Ok(());
+        }
+    };
+
+    if plain.is_empty() {
+        return Ok(());
+    }
+
+    match plain[0] {
+        0 => {
+            // MSG_TYPE_AUDIO
+            let audio = crate::proto::mumble_udp::Audio::decode(&plain[1..])?;
+            if let Some(packet) = VoicePacket::from_proto(&audio) {
+                let _ = event_tx.send(MumbleEvent::UdpAudio(packet));
+            }
+        }
+        1 => {
+            // MSG_TYPE_PING
+            let ping = crate::proto::mumble_udp::Ping::decode(&plain[1..])?;
+            let _ = event_tx.send(MumbleEvent::UdpPing(ping));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn update_udp_state_with_cryptsetup(
@@ -1492,18 +1591,25 @@ async fn handle_crypt_update(
     event_tx: &broadcast::Sender<MumbleEvent>,
     udp_options: &UdpOptions,
     udp_tunnel: &mut Option<UdpTunnel>,
+    tcp_tunnel_crypt: &mut Option<CryptStateOcb2>,
     writer: &mut (impl AsyncWrite + Unpin),
     resync_tx: &mpsc::Sender<()>,
     udp_resync_interval: Duration,
     #[cfg(feature = "audio")] playback: Option<Arc<AudioPlaybackManager>>,
 ) {
-    if !udp_options.enable {
-        return;
-    }
-
     match update {
         CryptUpdate::Full(params) => {
+            // Keep a TCP-tunnel decrypt state in sync even if UDP is disabled.
+            if let Some(crypt) = tcp_tunnel_crypt.as_mut() {
+                crypt.set_key(&params.key, &params.client_nonce, &params.server_nonce);
+            }
+
             let arc_params = Arc::new(params.clone());
+
+            if !udp_options.enable {
+                return;
+            }
+
             if let Some(tunnel) = udp_tunnel.as_ref() {
                 if let Err(err) = tunnel.update_key(Arc::clone(&arc_params)).await {
                     tracing::warn!("failed to update UDP key: {err}");
@@ -1538,6 +1644,15 @@ async fn handle_crypt_update(
             server_nonce,
             client_nonce,
         } => {
+            if let Some(crypt) = tcp_tunnel_crypt.as_mut() {
+                crypt.set_decrypt_iv(&server_nonce);
+                crypt.set_encrypt_iv(&client_nonce);
+            }
+
+            if !udp_options.enable {
+                return;
+            }
+
             if udp_tunnel.is_none() {
                 if let Some(params) = {
                     let guard = state.lock().await;
@@ -1695,7 +1810,8 @@ mod tests {
         let envelope =
             MessageEnvelope::try_from_message(TcpMessageKind::CryptSetup, &crypt).unwrap();
 
-        let update = handle_inbound_message(envelope, &state, &event_tx).await;
+        let mut tunnel_crypt: Option<CryptStateOcb2> = None;
+        let update = handle_inbound_message(envelope, &state, &event_tx, &mut tunnel_crypt).await;
         match update {
             Some(CryptUpdate::Full(params)) => {
                 assert_eq!(params.key, [1; 16]);

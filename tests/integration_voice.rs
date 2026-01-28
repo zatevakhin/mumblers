@@ -1,7 +1,10 @@
 use mumblers::audio::{AudioHeader, VoicePacket};
+use mumblers::messages::MumbleMessage;
 use mumblers::proto::mumble::ServerSync;
+use mumblers::proto::mumble_udp;
 use mumblers::server::{ChannelConfig, MumbleServer, ServerConfig};
 use mumblers::{ConnectionConfig, MumbleConnection, MumbleEvent};
+use prost::Message;
 use rcgen::generate_simple_self_signed;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -153,6 +156,111 @@ async fn connect_pair() -> (MumbleConnection, MumbleConnection, u32, u32) {
     (alice, bob, alice_session, bob_session)
 }
 
+async fn connect_pair_custom(enable_udp_a: bool, enable_udp_b: bool) -> (MumbleConnection, MumbleConnection, u32, u32) {
+    let (port, _handle) = start_server().await;
+    sleep(Duration::from_millis(200)).await;
+
+    let cfg_a = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("alice")
+        .accept_invalid_certs(true)
+        .enable_udp(enable_udp_a)
+        .build();
+    let mut alice = MumbleConnection::new(cfg_a);
+    let mut alice_events = alice.subscribe_events();
+
+    let cfg_b = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("bob")
+        .accept_invalid_certs(true)
+        .enable_udp(enable_udp_b)
+        .build();
+    let mut bob = MumbleConnection::new(cfg_b);
+    let mut bob_events = bob.subscribe_events();
+
+    alice.connect().await.expect("alice should connect");
+    bob.connect().await.expect("bob should connect");
+
+    sleep(Duration::from_millis(500)).await;
+
+    let alice_session = alice.state().await.session_id.expect("alice session");
+    let bob_session = bob.state().await.session_id.expect("bob session");
+
+    assert!(
+        wait_for_event(&mut alice_events, Duration::from_secs(5), |ev| matches!(
+            ev,
+            MumbleEvent::ServerSync(ServerSync { session: Some(id), .. }) if *id == alice_session
+        ))
+        .await
+        .is_some(),
+        "alice should receive ServerSync"
+    );
+    assert!(
+        wait_for_event(&mut bob_events, Duration::from_secs(5), |ev| matches!(
+            ev,
+            MumbleEvent::ServerSync(ServerSync { session: Some(id), .. }) if *id == bob_session
+        ))
+        .await
+        .is_some(),
+        "bob should receive ServerSync"
+    );
+
+    if enable_udp_a {
+        alice
+            .wait_for_udp_ready(Some(Duration::from_secs(5)))
+            .await
+            .expect("alice udp ready");
+    }
+    if enable_udp_b {
+        bob.wait_for_udp_ready(Some(Duration::from_secs(5)))
+            .await
+            .expect("bob udp ready");
+    }
+
+    (alice, bob, alice_session, bob_session)
+}
+
+async fn connect_single() -> (MumbleConnection, u32) {
+    let (port, _handle) = start_server().await;
+    sleep(Duration::from_millis(200)).await;
+
+    let cfg = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("alice")
+        .accept_invalid_certs(true)
+        .enable_udp(true)
+        .build();
+    let mut alice = MumbleConnection::new(cfg);
+    let mut alice_events = alice.subscribe_events();
+
+    alice.connect().await.expect("alice should connect");
+    sleep(Duration::from_millis(500)).await;
+
+    let alice_session = alice.state().await.session_id.expect("alice session");
+    assert!(
+        wait_for_event(&mut alice_events, Duration::from_secs(5), |ev| matches!(
+            ev,
+            MumbleEvent::ServerSync(ServerSync {
+                session: Some(id),
+                ..
+            }) if *id == alice_session
+        ))
+        .await
+        .is_some(),
+        "alice should receive ServerSync"
+    );
+
+    alice
+        .wait_for_udp_ready(Some(Duration::from_secs(5)))
+        .await
+        .expect("alice udp ready");
+
+    // Give the connection loop a moment to start the UDP tunnel.
+    sleep(Duration::from_millis(200)).await;
+
+    (alice, alice_session)
+}
+
 #[tokio::test]
 async fn voice_roundtrip() {
     init_tracing();
@@ -285,4 +393,141 @@ async fn voice_out_of_order_delivery() {
         frames.len(),
         "bob should eventually observe all voice frames despite reordering"
     );
+}
+
+#[tokio::test]
+async fn voice_udp_loopback() {
+    init_tracing();
+
+    let (alice, alice_session) = connect_single().await;
+
+    let mut alice_rx = alice.subscribe_events();
+    while let Ok(_) = alice_rx.try_recv() {}
+
+    // Use server loopback target (0x1f) so a single client can verify send+receive.
+    let packet = VoicePacket {
+        header: AudioHeader::Target(0x1f),
+        sender_session: None,
+        frame_number: 42,
+        opus_data: vec![9, 8, 7, 6],
+        positional_data: None,
+        volume_adjustment: None,
+        is_terminator: false,
+    };
+
+    let mut received: Option<VoicePacket> = None;
+    for _ in 0..5 {
+        alice
+            .send_audio(packet.clone())
+            .await
+            .expect("alice sends loopback audio");
+
+        if let Some(ev) = wait_for_event(&mut alice_rx, Duration::from_secs(2), |ev| {
+            matches!(ev, MumbleEvent::UdpAudio(_))
+        })
+        .await
+        {
+            if let MumbleEvent::UdpAudio(pkt) = ev {
+                received = Some(pkt);
+                break;
+            }
+        }
+
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let recv = received.expect("should receive loopback udp audio");
+    assert_eq!(recv.sender_session, Some(alice_session));
+    assert_eq!(recv.frame_number, packet.frame_number);
+    assert_eq!(recv.header, AudioHeader::Context(0));
+    assert_eq!(recv.opus_data, packet.opus_data);
+}
+
+#[tokio::test]
+async fn voice_tcp_tunnel_is_routed() {
+    init_tracing();
+
+    let (alice, bob, alice_session, _) = connect_pair_custom(true, false).await;
+
+    let mut bob_rx = bob.subscribe_events();
+    while let Ok(_) = bob_rx.try_recv() {}
+
+    let packet = VoicePacket {
+        header: AudioHeader::Target(0),
+        sender_session: None,
+        frame_number: 7,
+        opus_data: vec![10, 20, 30],
+        positional_data: None,
+        volume_adjustment: None,
+        is_terminator: false,
+    };
+
+    let mut audio: mumble_udp::Audio = packet.clone().into_proto();
+    audio.sender_session = 0;
+    let mut payload = audio.encode_to_vec();
+    payload.insert(0, 0u8); // MSG_TYPE_AUDIO
+
+    // Most real clients tunnel plaintext MumbleUDP frames.
+    alice
+        .send_message(MumbleMessage::UdpTunnel(payload))
+        .await
+        .expect("alice sends tcp tunneled voice");
+
+    let audio_ev = wait_for_event(&mut bob_rx, Duration::from_secs(5), |ev| {
+        matches!(ev, MumbleEvent::UdpAudio(_))
+    })
+    .await
+    .expect("bob should receive tunneled audio");
+
+    match audio_ev {
+        MumbleEvent::UdpAudio(recv) => {
+            assert_eq!(recv.sender_session, Some(alice_session));
+            assert_eq!(recv.frame_number, packet.frame_number);
+            assert_eq!(recv.header, AudioHeader::Context(0));
+            assert_eq!(recv.opus_data, packet.opus_data);
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn voice_udp_sender_reaches_tcp_only_receiver() {
+    init_tracing();
+
+    let (alice, bob, alice_session, _) = connect_pair_custom(true, false).await;
+
+    let mut bob_rx = bob.subscribe_events();
+    while let Ok(_) = bob_rx.try_recv() {}
+
+    // Bob never sends UDP, so the server should tunnel deliveries to him.
+    let packet = VoicePacket {
+        header: AudioHeader::Target(0),
+        sender_session: None,
+        frame_number: 9,
+        opus_data: vec![1, 1, 2, 3],
+        positional_data: None,
+        volume_adjustment: None,
+        is_terminator: false,
+    };
+
+    // Retry in case Alice's UDP tunnel isn't fully established yet.
+    for _ in 0..5 {
+        alice.send_audio(packet.clone()).await.expect("alice sends udp");
+        if let Some(ev) = wait_for_event(&mut bob_rx, Duration::from_secs(1), |ev| {
+            matches!(ev, MumbleEvent::UdpAudio(_))
+        })
+        .await
+        {
+            if let MumbleEvent::UdpAudio(recv) = ev {
+                assert_eq!(recv.sender_session, Some(alice_session));
+                assert_eq!(recv.frame_number, packet.frame_number);
+                assert_eq!(recv.header, AudioHeader::Context(0));
+                assert_eq!(recv.opus_data, packet.opus_data);
+                return;
+            }
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("bob should receive tunneled audio from udp sender");
 }

@@ -10,6 +10,14 @@ use crate::messages::MumbleMessage;
 
 pub type SessionId = u32;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpTunnelMode {
+    /// UDPTunnel payload contains plaintext MumbleUDP frames.
+    Plain,
+    /// UDPTunnel payload contains OCB2-encrypted UDP datagrams.
+    Encrypted,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
     pub id: u32,
@@ -84,6 +92,7 @@ struct InnerState {
     udp_pair: HashMap<SessionId, SocketAddr>,
     udp_pair_by_addr: HashMap<SocketAddr, SessionId>,
     crypt_states: HashMap<SessionId, Arc<tokio::sync::Mutex<CryptStateOcb2>>>,
+    tcp_tunnel_mode: HashMap<SessionId, TcpTunnelMode>,
     voice_stats: HashMap<SessionId, VoiceStats>,
     last_resync_request: HashMap<SessionId, Instant>,
     channels: HashMap<u32, ChannelInfo>,
@@ -112,6 +121,7 @@ impl ServerState {
                 udp_pair: HashMap::new(),
                 udp_pair_by_addr: HashMap::new(),
                 crypt_states: HashMap::new(),
+                tcp_tunnel_mode: HashMap::new(),
                 voice_stats: HashMap::new(),
                 last_resync_request: HashMap::new(),
                 channels,
@@ -208,6 +218,7 @@ impl ServerState {
             g.udp_pair_by_addr.remove(&addr);
         }
         g.crypt_states.remove(&session);
+        g.tcp_tunnel_mode.remove(&session);
         g.voice_stats.remove(&session);
         g.last_resync_request.remove(&session);
     }
@@ -441,6 +452,16 @@ impl ServerState {
     ) -> Option<Arc<tokio::sync::Mutex<CryptStateOcb2>>> {
         let g = self.inner.read().await;
         g.crypt_states.get(&session).cloned()
+    }
+
+    pub async fn get_tcp_tunnel_mode(&self, session: SessionId) -> Option<TcpTunnelMode> {
+        let g = self.inner.read().await;
+        g.tcp_tunnel_mode.get(&session).copied()
+    }
+
+    pub async fn set_tcp_tunnel_mode(&self, session: SessionId, mode: TcpTunnelMode) {
+        let mut g = self.inner.write().await;
+        g.tcp_tunnel_mode.insert(session, mode);
     }
 
     pub async fn channel_members(&self, channel_id: u32) -> Vec<SessionId> {

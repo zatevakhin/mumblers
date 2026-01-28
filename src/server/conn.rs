@@ -8,9 +8,9 @@ use tokio::sync::mpsc;
 use tokio_rustls::rustls::ServerConfig as TlsServerConfig;
 use tokio_rustls::TlsAcceptor;
 
-use super::state::{ChannelError, ChannelInfo, ServerState, UserInfo, VoiceMetrics};
+use super::state::{ChannelError, ChannelInfo, ServerState, TcpTunnelMode, UserInfo, VoiceMetrics};
 use crate::crypto::ocb2::CryptStateOcb2;
-use crate::messages::{read_envelope, write_message, MumbleMessage, PROTOCOL_VERSION};
+use crate::messages::{read_envelope, MumbleMessage, PROTOCOL_VERSION, write_message};
 use crate::proto::mumble::permission_denied::DenyType as PermissionDenyType;
 use crate::proto::mumble::reject::RejectType;
 use crate::proto::mumble::{
@@ -421,6 +421,11 @@ pub async fn handle_connection(
                     }
                 }
             }
+            Ok(MumbleMessage::UdpTunnel(tunnel)) => {
+                if let Err(err) = handle_tunnel_datagram(_state.clone(), session, &tunnel).await {
+                    tracing::debug!(session, error = %err, "server: tunneled UDP handling failed");
+                }
+            }
             Ok(_) => {}
             Err(err) => {
                 tracing::debug!(session, error=?err, "server: failed to decode message");
@@ -636,6 +641,7 @@ async fn spawn_writer_task(
 fn message_name(msg: &MumbleMessage) -> &'static str {
     match msg {
         MumbleMessage::Version(_) => "Version",
+        MumbleMessage::UdpTunnel(_) => "UdpTunnel",
         MumbleMessage::Authenticate(_) => "Authenticate",
         MumbleMessage::Reject(_) => "Reject",
         MumbleMessage::ServerSync(_) => "ServerSync",
@@ -649,6 +655,23 @@ fn message_name(msg: &MumbleMessage) -> &'static str {
         MumbleMessage::PermissionDenied(_) => "PermissionDenied",
         MumbleMessage::CodecVersion(_) => "CodecVersion",
         MumbleMessage::Unknown(_) => "Unknown",
+    }
+}
+
+async fn send_voice_payload(
+    state: &ServerState,
+    udp_socket: Option<&Arc<tokio::net::UdpSocket>>,
+    recipient: super::state::SessionId,
+    payload: &[u8],
+) -> Result<(), String> {
+    if let (Some(sock), Some(addr)) = (udp_socket, state.get_udp_pair(recipient).await) {
+        send_udp_plain(sock, state, recipient, addr, payload)
+            .await
+            .map_err(|err| err.to_string())
+    } else {
+        send_tcp_tunnel(state, recipient, payload)
+            .await
+            .map_err(|err| err.to_string())
     }
 }
 
@@ -758,27 +781,23 @@ async fn try_handle_unencrypted_ping(
     if data.is_empty() {
         return Ok(false);
     }
+
+    // Protobuf ping (unencrypted) is explicitly tagged with UDP_MSG_TYPE_PING.
+    // If protobuf decode fails, do NOT fall back to legacy probe handling because encrypted
+    // UDP packets can legitimately start with 0/1 depending on the IV byte.
     if data[0] == UDP_MSG_TYPE_PING {
         tracing::debug!(%addr, "server: plaintext proto ping detected");
-        if respond_proto_udp_probe(state, socket, &data[1..], addr).await? {
-            return Ok(true);
-        }
-        tracing::debug!(%addr, "server: plaintext proto ping decode failed, falling back");
+        return respond_proto_udp_probe(state, socket, &data[1..], addr).await;
     }
-    if data[0] == 0 && data.len() >= 12 {
-        if data.len() == 12 {
-            tracing::debug!(%addr, "server: legacy UDP probe received");
-            respond_legacy_udp_probe(state, socket, data, addr).await?;
-            return Ok(true);
-        }
-        tracing::debug!(%addr, len = data.len(), "server: extended plaintext ping candidate");
-        if respond_proto_udp_probe(state, socket, &data[1..], addr).await? {
-            return Ok(true);
-        }
-        tracing::debug!(%addr, "server: extended ping fallback to legacy reply");
+
+    // Legacy UDP probe is exactly 12 bytes and begins with 0.
+    // Do not treat longer packets beginning with 0 as probes; those can be encrypted voice.
+    if data[0] == 0 && data.len() == 12 {
+        tracing::debug!(%addr, "server: legacy UDP probe received");
         respond_legacy_udp_probe(state, socket, data, addr).await?;
         return Ok(true);
     }
+
     Ok(false)
 }
 
@@ -924,6 +943,37 @@ async fn decrypt_datagram(
     None
 }
 
+async fn decrypt_datagram_for_session(
+    state: &ServerState,
+    session: super::state::SessionId,
+    data: &[u8],
+) -> Result<(Vec<u8>, VoiceMetrics), String> {
+    let crypt_arc = state
+        .crypt_state(session)
+        .await
+        .ok_or_else(|| "missing crypt state".to_string())?;
+
+    let (result, last_good, metrics) = {
+        let mut guard = crypt_arc.lock().await;
+        let result = guard.decrypt(data);
+        let metrics = VoiceMetrics {
+            good: guard.ui_good,
+            late: guard.ui_late,
+            lost: guard.ui_lost,
+        };
+        (result, guard.t_last_good, metrics)
+    };
+
+    match result {
+        Ok(plain) => Ok((plain, metrics)),
+        Err(err) => {
+            tracing::debug!(session, error=?err, "server: tunneled udp decrypt failed");
+            maybe_request_resync(state, session, last_good).await;
+            Err("udp decrypt failed".into())
+        }
+    }
+}
+
 async fn maybe_request_resync(
     state: &ServerState,
     session: super::state::SessionId,
@@ -999,6 +1049,104 @@ mod udp_resync_tests {
     }
 }
 
+#[cfg(test)]
+mod udp_probe_tests {
+    use super::*;
+    use tokio::net::UdpSocket;
+    use tokio::time::{timeout, Duration};
+
+    fn default_state() -> ServerState {
+        let cfg = crate::server::ServerConfig::default();
+        ServerState::new(cfg)
+    }
+
+    async fn assert_no_udp_reply(sock: &UdpSocket) {
+        let mut buf = [0u8; 2048];
+        let res = timeout(Duration::from_millis(75), sock.recv_from(&mut buf)).await;
+        assert!(res.is_err(), "expected no UDP reply, but received one");
+    }
+
+    #[tokio::test]
+    async fn does_not_treat_len_gt_12_zero_prefix_as_probe() {
+        let state = default_state();
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Looks like an encrypted packet whose IV byte wrapped to 0.
+        let mut data = vec![0u8; 112];
+        data[0] = 0;
+        data[1] = 0xaa;
+        data[2] = 0xbb;
+
+        let handled =
+            try_handle_unencrypted_ping(&state, &server_sock, &data, client_sock.local_addr().unwrap())
+                .await
+                .unwrap();
+        assert!(!handled);
+        assert_no_udp_reply(&client_sock).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_probe_len_12_is_answered() {
+        let state = default_state();
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let data = vec![0u8; 12];
+        let handled =
+            try_handle_unencrypted_ping(&state, &server_sock, &data, client_sock.local_addr().unwrap())
+                .await
+                .unwrap();
+        assert!(handled);
+
+        let mut buf = [0u8; 2048];
+        let (n, _from) = timeout(Duration::from_millis(200), client_sock.recv_from(&mut buf))
+            .await
+            .expect("expected legacy reply")
+            .unwrap();
+        assert_eq!(n, 24);
+        // Version v1 should be 0x000105ff (patch capped to 255).
+        assert_eq!(&buf[0..4], &[0x00, 0x01, 0x05, 0xff]);
+    }
+
+    #[tokio::test]
+    async fn protobuf_ping_is_answered_and_invalid_ping_is_ignored() {
+        let state = default_state();
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = client_sock.local_addr().unwrap();
+
+        let mut ping = udp_proto::Ping::default();
+        ping.timestamp = 12345;
+        ping.request_extended_information = false;
+        let mut payload = ping.encode_to_vec();
+        payload.insert(0, UDP_MSG_TYPE_PING);
+
+        let handled = try_handle_unencrypted_ping(&state, &server_sock, &payload, addr)
+            .await
+            .unwrap();
+        assert!(handled);
+
+        let mut buf = [0u8; 2048];
+        let (n, _from) = timeout(Duration::from_millis(200), client_sock.recv_from(&mut buf))
+            .await
+            .expect("expected protobuf ping reply")
+            .unwrap();
+        assert!(n > 1);
+        assert_eq!(buf[0], UDP_MSG_TYPE_PING);
+        let reply = udp_proto::Ping::decode(&buf[1..n]).expect("reply ping decodes");
+        assert_eq!(reply.timestamp, 12345);
+
+        // Now send an invalid protobuf ping. It should not be handled and should not be answered.
+        let invalid = vec![UDP_MSG_TYPE_PING, 0xff, 0xff, 0xff];
+        let handled = try_handle_unencrypted_ping(&state, &server_sock, &invalid, addr)
+            .await
+            .unwrap();
+        assert!(!handled);
+        assert_no_udp_reply(&client_sock).await;
+    }
+}
+
 async fn process_udp_plain(
     state: &ServerState,
     socket: &Arc<tokio::net::UdpSocket>,
@@ -1012,9 +1160,108 @@ async fn process_udp_plain(
     }
     match plain[0] {
         UDP_MSG_TYPE_PING => handle_udp_ping(state, socket, session, &plain[1..], addr).await,
-        UDP_MSG_TYPE_AUDIO => handle_udp_audio(state, socket, session, &plain[1..], metrics).await,
+        UDP_MSG_TYPE_AUDIO => {
+            handle_udp_audio(state, Some(socket), session, &plain[1..], metrics).await
+        }
         other => {
             tracing::debug!(session, ty = other, "server: unknown UDP message type");
+            Ok(())
+        }
+    }
+}
+
+async fn handle_tunnel_datagram(
+    state: ServerState,
+    session: super::state::SessionId,
+    datagram: &[u8],
+) -> Result<(), String> {
+    if datagram.is_empty() {
+        return Ok(());
+    }
+
+    // Real clients commonly tunnel *plaintext* MumbleUDP frames over TCP (TLS already provides
+    // transport security). Some implementations tunnel the encrypted UDP datagram instead.
+    // Support both.
+
+    // 1) Plaintext attempt.
+    if datagram[0] == UDP_MSG_TYPE_AUDIO {
+        if udp_proto::Audio::decode(&datagram[1..]).is_ok() {
+            state
+                .set_tcp_tunnel_mode(session, TcpTunnelMode::Plain)
+                .await;
+            let udp_socket = state.udp_socket().await;
+            return handle_udp_audio(
+                &state,
+                udp_socket.as_ref(),
+                session,
+                &datagram[1..],
+                VoiceMetrics {
+                    good: 0,
+                    late: 0,
+                    lost: 0,
+                },
+            )
+            .await;
+        }
+    } else if datagram[0] == UDP_MSG_TYPE_PING {
+        if udp_proto::Ping::decode(&datagram[1..]).is_ok() {
+            state
+                .set_tcp_tunnel_mode(session, TcpTunnelMode::Plain)
+                .await;
+            let mut ping = udp_proto::Ping::decode(&datagram[1..])
+                .map_err(|err| format!("decode ping failed: {err}"))?;
+            tracing::debug!(session, ts=?ping.timestamp, "server: tunneled udp ping received");
+            if ping.request_extended_information {
+                let users = state.list_users().await;
+                ping.user_count = users.len() as u32;
+                ping.max_user_count = users.len() as u32;
+                if let Some(bw) = state.cfg.max_bandwidth {
+                    ping.max_bandwidth_per_user = bw;
+                }
+            }
+            let mut out = ping.encode_to_vec();
+            out.insert(0, UDP_MSG_TYPE_PING);
+            return send_tcp_tunnel(&state, session, &out)
+                .await
+                .map_err(|err| err.to_string());
+        }
+    }
+
+    // 2) Encrypted datagram attempt.
+    let (plain, metrics) = decrypt_datagram_for_session(&state, session, datagram).await?;
+    state
+        .set_tcp_tunnel_mode(session, TcpTunnelMode::Encrypted)
+        .await;
+
+    if plain.is_empty() {
+        return Ok(());
+    }
+
+    let udp_socket = state.udp_socket().await;
+    let udp_socket = udp_socket.as_ref();
+
+    match plain[0] {
+        UDP_MSG_TYPE_AUDIO => handle_udp_audio(&state, udp_socket, session, &plain[1..], metrics).await,
+        UDP_MSG_TYPE_PING => {
+            let mut ping = udp_proto::Ping::decode(&plain[1..])
+                .map_err(|err| format!("decode ping failed: {err}"))?;
+            tracing::debug!(session, ts=?ping.timestamp, "server: tunneled udp ping received");
+            if ping.request_extended_information {
+                let users = state.list_users().await;
+                ping.user_count = users.len() as u32;
+                ping.max_user_count = users.len() as u32;
+                if let Some(bw) = state.cfg.max_bandwidth {
+                    ping.max_bandwidth_per_user = bw;
+                }
+            }
+            let mut out = ping.encode_to_vec();
+            out.insert(0, UDP_MSG_TYPE_PING);
+            send_tcp_tunnel(&state, session, &out)
+                .await
+                .map_err(|err| err.to_string())
+        }
+        other => {
+            tracing::debug!(session, ty = other, "server: unknown tunneled UDP message type");
             Ok(())
         }
     }
@@ -1053,7 +1300,7 @@ async fn handle_udp_ping(
 
 async fn handle_udp_audio(
     state: &ServerState,
-    socket: &Arc<tokio::net::UdpSocket>,
+    udp_socket: Option<&Arc<tokio::net::UdpSocket>>,
     session: super::state::SessionId,
     payload: &[u8],
     metrics: VoiceMetrics,
@@ -1089,22 +1336,18 @@ async fn handle_udp_audio(
                 loopback.header = Some(udp_proto::audio::Header::Context(0));
                 let mut payload = loopback.encode_to_vec();
                 payload.insert(0, UDP_MSG_TYPE_AUDIO);
-                if let Some(addr) = state.get_udp_pair(session).await {
-                    if let Err(err) = send_udp_plain(socket, state, session, addr, &payload).await {
-                        tracing::debug!(session, error=?err, "server: loopback audio send failed");
-                    }
-                } else {
-                    tracing::debug!(session, "server: loopback audio dropped (no udp pair)");
+                if let Err(err) = send_voice_payload(state, udp_socket, session, &payload).await {
+                    tracing::debug!(session, error=%err, "server: loopback audio send failed");
                 }
             } else if target == 0 {
-                route_channel_audio(state, socket, session, &audio).await?;
+                route_channel_audio(state, udp_socket, session, &audio).await?;
             } else {
                 tracing::debug!(session, target, "server: unsupported voice target");
             }
         }
         udp_proto::audio::Header::Context(_) => {
             // Already contextualised – forward as-is to channel peers.
-            route_channel_audio(state, socket, session, &audio).await?;
+            route_channel_audio(state, udp_socket, session, &audio).await?;
         }
     }
 
@@ -1116,7 +1359,7 @@ async fn handle_udp_audio(
 
 async fn route_channel_audio(
     state: &ServerState,
-    socket: &Arc<tokio::net::UdpSocket>,
+    udp_socket: Option<&Arc<tokio::net::UdpSocket>>,
     session: super::state::SessionId,
     audio: &udp_proto::Audio,
 ) -> Result<(), String> {
@@ -1142,13 +1385,6 @@ async fn route_channel_audio(
         if target == session {
             continue;
         }
-        let addr = match state.get_udp_pair(target).await {
-            Some(addr) => addr,
-            None => {
-                tracing::debug!(session, target, "server: skipping audio, no UDP pair");
-                continue;
-            }
-        };
         let mut packet = audio.clone();
         packet.header = Some(udp_proto::audio::Header::Context(0));
         packet.sender_session = session;
@@ -1160,15 +1396,8 @@ async fn route_channel_audio(
             frame = packet.frame_number,
             "server: forwarding audio frame"
         );
-        if let Err(err) = send_udp_plain(socket, state, target, addr, &payload).await {
-            tracing::debug!(
-                session,
-                target,
-                error=?err,
-                "server: failed to forward audio"
-            );
-        } else {
-            tracing::trace!(session, target, "server: forwarded audio frame");
+        if let Err(err) = send_voice_payload(state, udp_socket, target, &payload).await {
+            tracing::debug!(session, target, error=%err, "server: failed to forward audio");
         }
     }
     Ok(())
@@ -1181,6 +1410,52 @@ async fn send_udp_plain(
     addr: SocketAddr,
     payload: &[u8],
 ) -> Result<(), std::io::Error> {
+    let encrypted = encrypt_udp_plain(state, session, payload).await?;
+    if let Some(raw) = state.get_crypt(session).await {
+        let mut client_view = CryptStateOcb2::new();
+        client_view.set_key(&raw.key, &raw.client_nonce, &raw.server_nonce);
+        if let Err(err) = client_view.decrypt(&encrypted) {
+            tracing::debug!(session, error=?err, "server: client-view decrypt failed");
+        }
+    }
+    socket.send_to(&encrypted, addr).await?;
+    Ok(())
+}
+
+async fn send_tcp_tunnel(
+    state: &ServerState,
+    recipient: super::state::SessionId,
+    payload: &[u8],
+) -> Result<(), std::io::Error> {
+    let mode = state
+        .get_tcp_tunnel_mode(recipient)
+        .await
+        .unwrap_or(TcpTunnelMode::Plain);
+
+    let bytes = match mode {
+        TcpTunnelMode::Plain => payload.to_vec(),
+        TcpTunnelMode::Encrypted => encrypt_udp_plain(state, recipient, payload).await?,
+    };
+
+    // Send raw bytes as TCP message type 1.
+    let ok = state
+        .send_to(recipient, MumbleMessage::UdpTunnel(bytes))
+        .await;
+    if ok {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "failed to queue tcp tunnel payload",
+        ))
+    }
+}
+
+async fn encrypt_udp_plain(
+    state: &ServerState,
+    session: super::state::SessionId,
+    payload: &[u8],
+) -> Result<Vec<u8>, std::io::Error> {
     let crypt_arc = match state.crypt_state(session).await {
         Some(arc) => arc,
         None => {
@@ -1192,18 +1467,9 @@ async fn send_udp_plain(
     };
     let encrypted = {
         let mut guard = crypt_arc.lock().await;
-        let encrypted = guard.encrypt(payload).map_err(|err| {
+        guard.encrypt(payload).map_err(|err| {
             std::io::Error::new(std::io::ErrorKind::Other, format!("encrypt failed: {err}"))
-        })?;
-        encrypted
+        })?
     };
-    if let Some(raw) = state.get_crypt(session).await {
-        let mut client_view = CryptStateOcb2::new();
-        client_view.set_key(&raw.key, &raw.client_nonce, &raw.server_nonce);
-        if let Err(err) = client_view.decrypt(&encrypted) {
-            tracing::debug!(session, error=?err, "server: client-view decrypt failed");
-        }
-    }
-    socket.send_to(&encrypted, addr).await?;
-    Ok(())
+    Ok(encrypted)
 }
