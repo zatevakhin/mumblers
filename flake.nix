@@ -9,6 +9,15 @@
     inputs.flake-parts.lib.mkFlake {inherit inputs;} {
       systems = ["x86_64-linux" "aarch64-darwin"];
 
+      flake = let
+        mumblersdModule = import ./nix/nixos-module/mumblersd.nix;
+      in {
+        nixosModules = {
+          mumblersd = mumblersdModule;
+          default = mumblersdModule;
+        };
+      };
+
       perSystem = {
         system,
         self',

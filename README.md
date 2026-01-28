@@ -85,8 +85,45 @@ nix run . -- serve --config mumblers.toml
 Remote (replace owner/repo):
 
 ```bash
-nix run github:<owner>/<repo> -- config --init
-nix run github:<owner>/<repo> -- serve --config mumblers.toml
+nix run github:zatevakhin/mumblers -- config --init
+nix run github:zatevakhin/mumblers -- serve --config mumblers.toml
+```
+
+## NixOS Service
+
+This repo exposes a NixOS module at `nixosModules.mumblersd`.
+
+Example flake-based NixOS config:
+
+```nix
+{
+  inputs.mumblers.url = "github:zatevakhin/mumblers";
+
+  outputs = { self, nixpkgs, mumblers, ... }:
+  let
+    system = "x86_64-linux";
+  in {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      inherit system;
+      modules = [
+        mumblers.nixosModules.mumblersd
+        ({ pkgs, ... }: {
+          services.mumblersd.enable = true;
+          services.mumblersd.openFirewall = true;
+
+          # Fully declarative config (written to the service StateDirectory).
+          services.mumblersd.settings = {
+            bind_host = "0.0.0.0";
+            bind_port = 64738;
+            udp_bind_port = 64738;
+            server_name = "mumblers";
+            allow_anonymous = true;
+          };
+        })
+      ];
+    };
+  };
+}
 ```
 
 ## Examples
