@@ -122,39 +122,41 @@ fn init_config(path: &Path, force: bool) -> Result<(), Box<dyn std::error::Error
         generate_self_signed_cert(&cert_path, &key_path)?;
     }
 
-    let mut cfg = ServerConfig::default();
-    cfg.default_channel = "Lobby".to_string();
-    cfg.channels = vec![
-        ChannelConfig {
-            name: "Lobby".to_string(),
-            parent: Some("Root".to_string()),
-            description: Some("General chat".to_string()),
-            position: Some(1),
-            max_users: None,
-            noenter: None,
-            silent: None,
-        },
-        ChannelConfig {
-            name: "Games".to_string(),
-            parent: Some("Lobby".to_string()),
-            description: Some("Gaming rooms".to_string()),
-            position: Some(2),
-            max_users: None,
-            noenter: None,
-            silent: None,
-        },
-        ChannelConfig {
-            name: "AFK".to_string(),
-            parent: Some("Root".to_string()),
-            description: Some("Away from keyboard".to_string()),
-            position: Some(3),
-            max_users: Some(1),
-            noenter: Some(true),
-            silent: Some(true),
-        },
-    ];
-    cfg.certificate = Some(DEFAULT_CERT_PATH.to_string());
-    cfg.private_key = Some(DEFAULT_KEY_PATH.to_string());
+    let cfg = ServerConfig {
+        default_channel: "Lobby".to_string(),
+        channels: vec![
+            ChannelConfig {
+                name: "Lobby".to_string(),
+                parent: Some("Root".to_string()),
+                description: Some("General chat".to_string()),
+                position: Some(1),
+                max_users: None,
+                noenter: None,
+                silent: None,
+            },
+            ChannelConfig {
+                name: "Games".to_string(),
+                parent: Some("Lobby".to_string()),
+                description: Some("Gaming rooms".to_string()),
+                position: Some(2),
+                max_users: None,
+                noenter: None,
+                silent: None,
+            },
+            ChannelConfig {
+                name: "AFK".to_string(),
+                parent: Some("Root".to_string()),
+                description: Some("Away from keyboard".to_string()),
+                position: Some(3),
+                max_users: Some(1),
+                noenter: Some(true),
+                silent: Some(true),
+            },
+        ],
+        certificate: Some(DEFAULT_CERT_PATH.to_string()),
+        private_key: Some(DEFAULT_KEY_PATH.to_string()),
+        ..Default::default()
+    };
     let toml = toml::to_string_pretty(&cfg)?;
 
     if let Some(parent) = path.parent() {

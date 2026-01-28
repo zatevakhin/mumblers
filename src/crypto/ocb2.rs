@@ -1,5 +1,5 @@
 use aes::Aes128;
-use cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
+use cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use rand::{rngs::OsRng, RngCore};
 use std::time::Instant;
 
@@ -46,7 +46,7 @@ impl CryptStateOcb2 {
         OsRng.fill_bytes(&mut key);
         OsRng.fill_bytes(&mut enc_iv);
         OsRng.fill_bytes(&mut dec_iv);
-        let aes = Aes128::new(GenericArray::from_slice(&key));
+        let aes = Aes128::new_from_slice(&key).expect("AES-128 key length");
         Self {
             aes,
             raw_key: key,
@@ -64,7 +64,7 @@ impl CryptStateOcb2 {
         OsRng.fill_bytes(&mut self.raw_key);
         OsRng.fill_bytes(&mut self.encrypt_iv);
         OsRng.fill_bytes(&mut self.decrypt_iv);
-        self.aes = Aes128::new(GenericArray::from_slice(&self.raw_key));
+        self.aes = Aes128::new_from_slice(&self.raw_key).expect("AES-128 key length");
         self.decrypt_history = [0; 0x100];
         self.t_last_good = Some(Instant::now());
     }
@@ -76,7 +76,7 @@ impl CryptStateOcb2 {
         self.raw_key.copy_from_slice(key);
         self.encrypt_iv.copy_from_slice(encrypt_iv);
         self.decrypt_iv.copy_from_slice(decrypt_iv);
-        self.aes = Aes128::new(GenericArray::from_slice(&self.raw_key));
+        self.aes = Aes128::new_from_slice(&self.raw_key).expect("AES-128 key length");
         self.decrypt_history = [0; 0x100];
         self.t_last_good = Some(Instant::now());
     }
@@ -133,7 +133,7 @@ impl CryptStateOcb2 {
                 lost = (ivbyte - div[0] - 1) as i32;
                 div[0] = ivbyte;
             } else if ivbyte < div[0] && diff > 0 {
-                lost = (0x100 - div[0] as i32 + ivbyte as i32 - 1) as i32;
+                lost = 0x100 - div[0] as i32 + ivbyte as i32 - 1;
                 div[0] = ivbyte;
                 increment_iv(&mut div, 1);
             } else {
@@ -299,18 +299,18 @@ fn decrypt_block(aes: &Aes128, block: &[u8; BLOCK_SIZE]) -> [u8; BLOCK_SIZE] {
 }
 
 fn increment_iv(iv: &mut [u8; BLOCK_SIZE], start: usize) {
-    for i in start..BLOCK_SIZE {
-        iv[i] = iv[i].wrapping_add(1);
-        if iv[i] != 0 {
+    for byte in iv.iter_mut().skip(start) {
+        *byte = byte.wrapping_add(1);
+        if *byte != 0 {
             break;
         }
     }
 }
 
 fn decrement_iv(iv: &mut [u8; BLOCK_SIZE], start: usize) {
-    for i in start..BLOCK_SIZE {
-        iv[i] = iv[i].wrapping_sub(1);
-        if iv[i] != u8::MAX {
+    for byte in iv.iter_mut().skip(start) {
+        *byte = byte.wrapping_sub(1);
+        if *byte != u8::MAX {
             break;
         }
     }
@@ -335,12 +335,18 @@ fn s2(block: &[u8; BLOCK_SIZE]) -> [u8; BLOCK_SIZE] {
     let mut low = u64::from_be_bytes(block[..8].try_into().unwrap());
     let mut high = u64::from_be_bytes(block[8..].try_into().unwrap());
     let carry = (low >> 63) & 1;
-    low = ((low << 1) | (high >> 63)) & u64::MAX;
-    high = ((high << 1) ^ ((carry as u64) * 0x87)) & u64::MAX;
+    low = (low << 1) | (high >> 63);
+    high = (high << 1) ^ (carry * 0x87);
     let mut out = [0u8; BLOCK_SIZE];
     out[..8].copy_from_slice(&low.to_be_bytes());
     out[8..].copy_from_slice(&high.to_be_bytes());
     out
+}
+
+impl Default for CryptStateOcb2 {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]

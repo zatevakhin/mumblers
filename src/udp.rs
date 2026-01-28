@@ -103,10 +103,11 @@ impl UdpTunnel {
                                         let can_request = last_resync_request
                                             .map(|prev| now.duration_since(prev) > resync_interval)
                                             .unwrap_or(true);
-                                        if stale && can_request {
-                                            if resync_tx.try_send(()).is_ok() {
-                                                last_resync_request = Some(now);
-                                            }
+                                        if stale
+                                            && can_request
+                                            && resync_tx.try_send(()).is_ok()
+                                        {
+                                            last_resync_request = Some(now);
                                         }
                                     }
                                 }
@@ -196,15 +197,17 @@ impl Drop for UdpTunnel {
 }
 
 async fn send_ping(socket: &UdpSocket, crypt: &Arc<Mutex<CryptStateOcb2>>) -> std::io::Result<()> {
-    let mut ping = crate::proto::mumble_udp::Ping::default();
-    ping.timestamp = current_millis();
+    let ping = crate::proto::mumble_udp::Ping {
+        timestamp: current_millis(),
+        ..Default::default()
+    };
     let mut payload = ping.encode_to_vec();
     payload.insert(0, MSG_TYPE_PING);
     let packet = {
         let mut guard = crypt.lock().await;
         guard
             .encrypt(&payload)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?
+            .map_err(|err| std::io::Error::other(err.to_string()))?
     };
     socket.send(&packet).await?;
     Ok(())
@@ -223,7 +226,7 @@ async fn send_audio(
         let mut guard = crypt.lock().await;
         guard
             .encrypt(&payload)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?
+            .map_err(|err| std::io::Error::other(err.to_string()))?
     };
     tracing::debug!(frame, bytes = encrypted.len(), "client: udp audio sent");
     socket.send(&encrypted).await?;

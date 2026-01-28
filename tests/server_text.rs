@@ -72,7 +72,7 @@ async fn private_text_routing_and_invalid_target() {
         .build();
     let mut a = MumbleConnection::new(cfg_a);
     a.connect().await.expect("a connect");
-    let a_sess = a.state().await.session_id.unwrap();
+    let _a_sess = a.state().await.session_id.unwrap();
 
     let cfg_b = ConnectionConfig::builder("127.0.0.1")
         .port(port)

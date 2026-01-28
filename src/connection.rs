@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
-use rand::{rngs::OsRng, RngCore};
 use prost::Message;
+use rand::{rngs::OsRng, RngCore};
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
@@ -24,12 +24,12 @@ use tokio_rustls::{client::TlsStream, TlsConnector};
 #[cfg(feature = "audio")]
 use crate::audio::AudioPlaybackManager;
 use crate::audio::VoicePacket;
+use crate::crypto::ocb2::CryptStateOcb2;
 use crate::error::MumbleError;
 use crate::messages::{
     read_envelope, MessageDecodeError, MessageEnvelope, MumbleMessage, TcpFrameDecoder,
     TcpMessageKind,
 };
-use crate::crypto::ocb2::CryptStateOcb2;
 use crate::proto::mumble::{
     reject::RejectType, Authenticate, ChannelRemove, ChannelState, CodecVersion, CryptSetup,
     PermissionDenied, TextMessage, UserRemove, UserState, Version,
@@ -38,9 +38,9 @@ use crate::state::{ClientState, UdpState};
 use crate::udp::UdpTunnel;
 
 enum ConnectionCommand {
-    SendPing,
-    SendAudio(VoicePacket),
-    SendMessage(MumbleMessage),
+    Ping,
+    Audio(VoicePacket),
+    Message(Box<MumbleMessage>),
 }
 
 #[derive(Clone, Debug)]
@@ -91,16 +91,11 @@ pub enum MumbleEvent {
 }
 
 /// Identifies the type of client connecting to the server.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ClientType {
     Regular = 0,
+    #[default]
     Bot = 1,
-}
-
-impl Default for ClientType {
-    fn default() -> Self {
-        ClientType::Bot
-    }
 }
 
 impl From<ClientType> for i32 {
@@ -443,9 +438,9 @@ impl MumbleConnection {
                 MumbleMessage::CodecVersion(codec) => {
                     {
                         let mut state = self.shared_state.lock().await;
-                        state.codec_version = Some(codec.clone());
+                        state.codec_version = Some(codec);
                     }
-                    let _ = self.event_tx.send(MumbleEvent::CodecVersion(codec.clone()));
+                    let _ = self.event_tx.send(MumbleEvent::CodecVersion(codec));
                 }
                 MumbleMessage::Reject(reject) => {
                     let mut reason = reject
@@ -510,7 +505,7 @@ impl MumbleConnection {
         message: crate::messages::MumbleMessage,
     ) -> Result<(), MumbleError> {
         if let Some(tx) = &self.command_tx {
-            tx.send(ConnectionCommand::SendMessage(message))
+            tx.send(ConnectionCommand::Message(Box::new(message)))
                 .await
                 .map_err(|_| MumbleError::ConnectionLost("failed to send command"))?;
             Ok(())
@@ -641,7 +636,7 @@ impl MumbleConnection {
 
     /// Last codec negotiation preferences announced by the server, if any.
     pub async fn codec_version(&self) -> Option<crate::proto::mumble::CodecVersion> {
-        self.shared_state.lock().await.codec_version.clone()
+        self.shared_state.lock().await.codec_version
     }
 
     /// Access the shared playback manager that buffers incoming voice audio.
@@ -688,7 +683,7 @@ impl MumbleConnection {
     /// Send a ping message immediately and update latency statistics.
     pub async fn send_ping(&mut self) -> Result<(), MumbleError> {
         if let Some(tx) = &self.command_tx {
-            tx.send(ConnectionCommand::SendPing)
+            tx.send(ConnectionCommand::Ping)
                 .await
                 .map_err(|_| MumbleError::ConnectionLost("connection task stopped"))?
         } else {
@@ -707,7 +702,7 @@ impl MumbleConnection {
             ));
         }
         if let Some(tx) = &self.command_tx {
-            tx.send(ConnectionCommand::SendAudio(packet))
+            tx.send(ConnectionCommand::Audio(packet))
                 .await
                 .map_err(|_| MumbleError::ConnectionLost("connection task stopped"))?;
         } else {
@@ -1003,6 +998,7 @@ fn apply_latency_metrics(state: &mut ClientState, ping: &crate::proto::mumble::P
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connection_loop(
     stream: TlsStream<TcpStream>,
     state: Arc<Mutex<ClientState>>,
@@ -1085,25 +1081,25 @@ async fn connection_loop(
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(ConnectionCommand::SendPing) => {
+                    Some(ConnectionCommand::Ping) => {
                         if send_ping_internal(&mut writer, &state).await.is_err() {
                             break;
                         }
                     }
-                     Some(ConnectionCommand::SendAudio(packet)) => {
-                         if let Some(tunnel) = udp_tunnel.as_ref() {
-                             if let Err(err) = tunnel.send_audio(packet).await {
-                                 tracing::warn!("failed to send UDP audio: {err}");
-                             }
-                         } else {
-                             tracing::debug!("discarding audio frame: UDP tunnel not yet established");
-                         }
-                     }
-                     Some(ConnectionCommand::SendMessage(message)) => {
+                     Some(ConnectionCommand::Audio(packet)) => {
+                          if let Some(tunnel) = udp_tunnel.as_ref() {
+                              if let Err(err) = tunnel.send_audio(packet).await {
+                                  tracing::warn!("failed to send UDP audio: {err}");
+                              }
+                          } else {
+                              tracing::debug!("discarding audio frame: UDP tunnel not yet established");
+                          }
+                      }
+                     Some(ConnectionCommand::Message(message)) => {
                          if let Err(err) = crate::messages::write_message(&mut writer, &message).await {
-                             tracing::warn!("failed to send message: {err}");
-                         }
-                     }
+                              tracing::warn!("failed to send message: {err}");
+                          }
+                      }
                     None => break,
                 }
             }
@@ -1181,10 +1177,12 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut guard = state.lock().await;
-    let mut ping = crate::proto::mumble::Ping::default();
-    ping.timestamp = Some(current_millis());
-    ping.tcp_packets = Some(guard.ping_sent as u32);
-    ping.tcp_ping_avg = Some(guard.ping_average_ms as f32);
+    let ping = crate::proto::mumble::Ping {
+        timestamp: Some(current_millis()),
+        tcp_packets: Some(guard.ping_sent as u32),
+        tcp_ping_avg: Some(guard.ping_average_ms as f32),
+        ..Default::default()
+    };
     guard.ping_sent += 1;
     drop(guard);
 
@@ -1214,7 +1212,7 @@ async fn handle_inbound_message(
         Ok(MumbleMessage::CodecVersion(message)) => {
             {
                 let mut guard = state.lock().await;
-                guard.codec_version = Some(message.clone());
+                guard.codec_version = Some(message);
             }
             let _ = event_tx.send(MumbleEvent::CodecVersion(message));
             None
@@ -1564,13 +1562,19 @@ where
     };
 
     if let Some(params) = params {
-        let mut setup = CryptSetup::default();
-        if include_key {
-            setup.key = Some(params.key.to_vec());
-        }
-        if include_client {
-            setup.client_nonce = Some(params.client_nonce.to_vec());
-        }
+        let setup = CryptSetup {
+            key: if include_key {
+                Some(params.key.to_vec())
+            } else {
+                None
+            },
+            client_nonce: if include_client {
+                Some(params.client_nonce.to_vec())
+            } else {
+                None
+            },
+            ..Default::default()
+        };
         send_message(writer, TcpMessageKind::CryptSetup, &setup).await?;
     }
 
@@ -1585,6 +1589,7 @@ where
     send_message(writer, TcpMessageKind::CryptSetup, &setup).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_crypt_update(
     update: CryptUpdate,
     state: &Arc<Mutex<ClientState>>,
@@ -1614,30 +1619,28 @@ async fn handle_crypt_update(
                 if let Err(err) = tunnel.update_key(Arc::clone(&arc_params)).await {
                     tracing::warn!("failed to update UDP key: {err}");
                 }
-            } else {
-                if let Some(target) = udp_options.target {
-                    match UdpTunnel::start(
-                        target,
-                        Arc::clone(&arc_params),
-                        event_tx.clone(),
-                        #[cfg(feature = "audio")]
-                        playback.clone(),
-                        resync_tx.clone(),
-                        udp_resync_interval,
-                    )
-                    .await
-                    {
-                        Ok(tunnel) => {
-                            tracing::info!("UDP tunnel established");
-                            *udp_tunnel = Some(tunnel);
-                        }
-                        Err(err) => tracing::warn!("failed to start UDP tunnel: {err}"),
+            } else if let Some(target) = udp_options.target {
+                match UdpTunnel::start(
+                    target,
+                    Arc::clone(&arc_params),
+                    event_tx.clone(),
+                    #[cfg(feature = "audio")]
+                    playback.clone(),
+                    resync_tx.clone(),
+                    udp_resync_interval,
+                )
+                .await
+                {
+                    Ok(tunnel) => {
+                        tracing::info!("UDP tunnel established");
+                        *udp_tunnel = Some(tunnel);
                     }
-                } else {
-                    tracing::warn!(
-                        "UDP parameters received but no resolved target address; cannot start tunnel"
-                    );
+                    Err(err) => tracing::warn!("failed to start UDP tunnel: {err}"),
                 }
+            } else {
+                tracing::warn!(
+                    "UDP parameters received but no resolved target address; cannot start tunnel"
+                );
             }
         }
         CryptUpdate::Resync {
@@ -1843,7 +1846,7 @@ fn create_tls_connector(accept_invalid_certs: bool) -> Result<TlsConnector, Mumb
     let builder = if accept_invalid_certs {
         builder
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification::default()))
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
     } else {
         let root_store = rustls::RootCertStore::empty();
         builder.with_root_certificates(root_store)
@@ -1957,38 +1960,35 @@ fn build_version_message() -> Version {
     let minor = PROTOCOL_VERSION.1 as u64;
     let patch = PROTOCOL_VERSION.2 as u64;
 
-    let mut version = Version::default();
-
-    let version_v1_patch = PROTOCOL_VERSION.2.min(255) as u32;
-    let version_v1 =
-        ((PROTOCOL_VERSION.0 as u32) << 16) | ((PROTOCOL_VERSION.1 as u32) << 8) | version_v1_patch;
+    let version_v1_patch = PROTOCOL_VERSION.2.min(255);
+    let version_v1 = (PROTOCOL_VERSION.0 << 16) | (PROTOCOL_VERSION.1 << 8) | version_v1_patch;
     let version_v2 = (major << 48) | (minor << 32) | (patch << 16);
 
-    version.version_v1 = Some(version_v1);
-    version.version_v2 = Some(version_v2);
-    version.release = Some(format!("mumble-rs {}", env!("CARGO_PKG_VERSION")));
-    version.os = Some(format!("{} {}", env::consts::OS, env::consts::ARCH));
-    version.os_version = Some(format!("Rust {}", env!("CARGO_PKG_VERSION")));
-    version
+    Version {
+        version_v1: Some(version_v1),
+        version_v2: Some(version_v2),
+        release: Some(format!("mumble-rs {}", env!("CARGO_PKG_VERSION"))),
+        os: Some(format!("{} {}", env::consts::OS, env::consts::ARCH)),
+        os_version: Some(format!("Rust {}", env!("CARGO_PKG_VERSION"))),
+    }
 }
 
 fn build_authenticate_message(config: &ConnectionConfig) -> Authenticate {
-    let mut auth = Authenticate::default();
-    auth.username = Some(config.username.clone());
-    if let Some(password) = &config.password {
-        auth.password = Some(password.clone());
+    Authenticate {
+        username: Some(config.username.clone()),
+        password: config.password.clone(),
+        tokens: config.tokens.clone(),
+        celt_versions: Vec::new(),
+        opus: Some(true),
+        client_type: Some(i32::from(config.client_type)),
     }
-    auth.tokens = config.tokens.clone();
-    auth.opus = Some(true);
-    auth.client_type = Some(i32::from(config.client_type));
-    auth
 }
 
 fn build_codec_version_message() -> CodecVersion {
-    let mut codec = CodecVersion::default();
-    codec.alpha = -2147483637;
-    codec.beta = -2147483637;
-    codec.prefer_alpha = false;
-    codec.opus = Some(true);
-    codec
+    CodecVersion {
+        alpha: -2147483637,
+        beta: -2147483637,
+        prefer_alpha: false,
+        opus: Some(true),
+    }
 }

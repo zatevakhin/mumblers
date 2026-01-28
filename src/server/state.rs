@@ -10,6 +10,13 @@ use crate::messages::MumbleMessage;
 
 pub type SessionId = u32;
 
+type ChannelBuild = (
+    HashMap<u32, ChannelInfo>,
+    HashMap<String, u32>,
+    HashMap<u32, HashSet<SessionId>>,
+    u32,
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpTunnelMode {
     /// UDPTunnel payload contains plaintext MumbleUDP frames.
@@ -44,7 +51,7 @@ pub struct UdpCrypt {
     pub client_nonce: [u8; 16],
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct VoiceStats {
     pub packets: u64,
     pub last_frame: Option<u64>,
@@ -52,19 +59,6 @@ pub struct VoiceStats {
     pub good: u32,
     pub late: u32,
     pub lost: i32,
-}
-
-impl Default for VoiceStats {
-    fn default() -> Self {
-        Self {
-            packets: 0,
-            last_frame: None,
-            last_update: None,
-            good: 0,
-            late: 0,
-            lost: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -507,14 +501,7 @@ impl ServerState {
     }
 }
 
-fn build_channels(
-    cfg: &ServerConfig,
-) -> (
-    HashMap<u32, ChannelInfo>,
-    HashMap<String, u32>,
-    HashMap<u32, HashSet<SessionId>>,
-    u32,
-) {
+fn build_channels(cfg: &ServerConfig) -> ChannelBuild {
     let mut channels = HashMap::new();
     let mut name_idx = HashMap::new();
     let mut members: HashMap<u32, HashSet<SessionId>> = HashMap::new();

@@ -156,7 +156,10 @@ async fn connect_pair() -> (MumbleConnection, MumbleConnection, u32, u32) {
     (alice, bob, alice_session, bob_session)
 }
 
-async fn connect_pair_custom(enable_udp_a: bool, enable_udp_b: bool) -> (MumbleConnection, MumbleConnection, u32, u32) {
+async fn connect_pair_custom(
+    enable_udp_a: bool,
+    enable_udp_b: bool,
+) -> (MumbleConnection, MumbleConnection, u32, u32) {
     let (port, _handle) = start_server().await;
     sleep(Duration::from_millis(200)).await;
 
@@ -512,7 +515,10 @@ async fn voice_udp_sender_reaches_tcp_only_receiver() {
 
     // Retry in case Alice's UDP tunnel isn't fully established yet.
     for _ in 0..5 {
-        alice.send_audio(packet.clone()).await.expect("alice sends udp");
+        alice
+            .send_audio(packet.clone())
+            .await
+            .expect("alice sends udp");
         if let Some(ev) = wait_for_event(&mut bob_rx, Duration::from_secs(1), |ev| {
             matches!(ev, MumbleEvent::UdpAudio(_))
         })

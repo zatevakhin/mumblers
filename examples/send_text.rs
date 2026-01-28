@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let args = Args::parse();
 
-    let mut cfg = ConnectionConfig::builder(&args.host)
+    let cfg = ConnectionConfig::builder(&args.host)
         .port(args.port)
         .username(&args.username)
         .accept_invalid_certs(args.insecure)

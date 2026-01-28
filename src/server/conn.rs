@@ -10,7 +10,7 @@ use tokio_rustls::TlsAcceptor;
 
 use super::state::{ChannelError, ChannelInfo, ServerState, TcpTunnelMode, UserInfo, VoiceMetrics};
 use crate::crypto::ocb2::CryptStateOcb2;
-use crate::messages::{read_envelope, MumbleMessage, PROTOCOL_VERSION, write_message};
+use crate::messages::{read_envelope, write_message, MumbleMessage, PROTOCOL_VERSION};
 use crate::proto::mumble::permission_denied::DenyType as PermissionDenyType;
 use crate::proto::mumble::reject::RejectType;
 use crate::proto::mumble::{
@@ -47,9 +47,11 @@ pub async fn handle_connection(
     let mut tls = acceptor.accept(sock).await?;
     tracing::info!(%peer, "tls accepted");
 
-    let mut version = Version::default();
-    version.version_v1 = Some(0x0105_02df);
-    version.release = Some("mumblers".into());
+    let version = Version {
+        version_v1: Some(0x0105_02df),
+        release: Some("mumblers".into()),
+        ..Default::default()
+    };
     write_message(&mut tls, &MumbleMessage::Version(version)).await?;
 
     let session = loop {
@@ -69,15 +71,17 @@ pub async fn handle_connection(
                 }
             }
             Ok(MumbleMessage::Ping(p)) => {
-                let mut reply = Ping::default();
-                reply.timestamp = match p.timestamp {
-                    Some(0) => None,
-                    other => other,
+                let reply = Ping {
+                    timestamp: match p.timestamp {
+                        Some(0) => None,
+                        other => other,
+                    },
+                    good: Some(0),
+                    late: Some(0),
+                    lost: Some(0),
+                    resync: Some(0),
+                    ..Default::default()
                 };
-                reply.good = Some(0);
-                reply.late = Some(0);
-                reply.lost = Some(0);
-                reply.resync = Some(0);
                 write_message(&mut tls, &MumbleMessage::Ping(reply)).await?;
             }
             Ok(_) => {}
@@ -101,8 +105,10 @@ pub async fn handle_connection(
                     error = ?err,
                     "server: read_envelope failed, closing connection"
                 );
-                let mut remove = UserRemove::default();
-                remove.session = session;
+                let remove = UserRemove {
+                    session,
+                    ..Default::default()
+                };
                 let _ = _state
                     .broadcast_except(session, MumbleMessage::UserRemove(remove))
                     .await;
@@ -122,15 +128,17 @@ pub async fn handle_connection(
         }
         match parsed {
             Ok(MumbleMessage::Ping(p)) => {
-                let mut reply = Ping::default();
-                reply.timestamp = match p.timestamp {
-                    Some(0) => None,
-                    other => other,
+                let reply = Ping {
+                    timestamp: match p.timestamp {
+                        Some(0) => None,
+                        other => other,
+                    },
+                    good: Some(0),
+                    late: Some(0),
+                    lost: Some(0),
+                    resync: Some(0),
+                    ..Default::default()
                 };
-                reply.good = Some(0);
-                reply.late = Some(0);
-                reply.lost = Some(0);
-                reply.resync = Some(0);
                 tracing::debug!(session, "server: replying to ping");
                 if let Err(err) = writer_tx.send(MumbleMessage::Ping(reply)).await {
                     tracing::warn!(session, error = ?err, "server: failed to queue ping reply");
@@ -180,8 +188,10 @@ pub async fn handle_connection(
                 }
 
                 if req.client_nonce.is_none() {
-                    let mut resp = CryptSetup::default();
-                    resp.server_nonce = Some(cs.server_nonce.to_vec());
+                    let resp = CryptSetup {
+                        server_nonce: Some(cs.server_nonce.to_vec()),
+                        ..Default::default()
+                    };
                     if let Err(err) = writer_tx.send(MumbleMessage::CryptSetup(resp)).await {
                         tracing::warn!(
                             session,
@@ -204,10 +214,12 @@ pub async fn handle_connection(
                 );
                 let target_session = incoming.session.unwrap_or(session);
                 if target_session != session {
-                    let mut pd = PermissionDenied::default();
-                    pd.r#type = Some(PermissionDenyType::Permission as i32);
-                    pd.reason = Some("Cannot modify other users".to_string());
-                    pd.session = Some(session);
+                    let pd = PermissionDenied {
+                        r#type: Some(PermissionDenyType::Permission as i32),
+                        reason: Some("Cannot modify other users".to_string()),
+                        session: Some(session),
+                        ..Default::default()
+                    };
                     if let Err(err) = writer_tx.send(MumbleMessage::PermissionDenied(pd)).await {
                         tracing::warn!(
                             session,
@@ -230,13 +242,13 @@ pub async fn handle_connection(
                                 channel = info.channel_id,
                                 "server: user moved channel"
                             );
-                            let mut update = UserState::default();
-                            update.session = Some(info.session);
-                            update.actor = Some(session);
-                            update.channel_id = Some(info.channel_id);
-                            if let Some(name) = info.name.clone() {
-                                update.name = Some(name);
-                            }
+                            let update = UserState {
+                                session: Some(info.session),
+                                actor: Some(session),
+                                channel_id: Some(info.channel_id),
+                                name: info.name.clone(),
+                                ..Default::default()
+                            };
                             let msg = MumbleMessage::UserState(update.clone());
                             let delivered_self = _state.send_to(session, msg.clone()).await;
                             if delivered_self {
@@ -266,9 +278,6 @@ pub async fn handle_connection(
                             }
                         }
                         Err(err) => {
-                            let mut pd = PermissionDenied::default();
-                            pd.session = Some(session);
-                            pd.channel_id = Some(dest_channel);
                             let (deny_type, reason) = match err {
                                 ChannelError::NoEnter(name) => (
                                     PermissionDenyType::Permission,
@@ -287,8 +296,13 @@ pub async fn handle_connection(
                                     "Unknown session".to_string(),
                                 ),
                             };
-                            pd.r#type = Some(deny_type as i32);
-                            pd.reason = Some(reason);
+                            let pd = PermissionDenied {
+                                session: Some(session),
+                                channel_id: Some(dest_channel),
+                                r#type: Some(deny_type as i32),
+                                reason: Some(reason),
+                                ..Default::default()
+                            };
                             if let Err(err) =
                                 writer_tx.send(MumbleMessage::PermissionDenied(pd)).await
                             {
@@ -322,10 +336,12 @@ pub async fn handle_connection(
                         if target == session {
                             continue;
                         }
-                        let mut out = TextMessage::default();
-                        out.actor = Some(session);
-                        out.message = tm.message.clone();
-                        out.session = vec![target];
+                        let out = TextMessage {
+                            actor: Some(session),
+                            message: tm.message.clone(),
+                            session: vec![target],
+                            ..Default::default()
+                        };
                         let ok = _state
                             .send_to(target, MumbleMessage::TextMessage(out.clone()))
                             .await;
@@ -336,39 +352,44 @@ pub async fn handle_connection(
                     let current = _state.user_info(session).await;
                     let target_channel = tm
                         .channel_id
-                        .get(0)
+                        .first()
                         .copied()
                         .or_else(|| current.as_ref().map(|u| u.channel_id));
                     match (current, target_channel) {
                         (_, None) => {
-                            let mut pd = PermissionDenied::default();
-                            pd.r#type = Some(PermissionDenyType::Text as i32);
-                            pd.reason = Some("Missing target channel".to_string());
-                            pd.session = Some(session);
-                            denial = Some(pd);
+                            denial = Some(PermissionDenied {
+                                r#type: Some(PermissionDenyType::Text as i32),
+                                reason: Some("Missing target channel".to_string()),
+                                session: Some(session),
+                                ..Default::default()
+                            });
                         }
                         (Some(user), Some(chan_id)) => {
                             if user.channel_id != chan_id {
-                                let mut pd = PermissionDenied::default();
-                                pd.r#type = Some(PermissionDenyType::Permission as i32);
-                                pd.reason = Some(
-                                    "Cannot broadcast to a channel you are not in".to_string(),
-                                );
-                                pd.session = Some(session);
-                                pd.channel_id = Some(chan_id);
-                                denial = Some(pd);
+                                denial = Some(PermissionDenied {
+                                    r#type: Some(PermissionDenyType::Permission as i32),
+                                    reason: Some(
+                                        "Cannot broadcast to a channel you are not in".to_string(),
+                                    ),
+                                    session: Some(session),
+                                    channel_id: Some(chan_id),
+                                    ..Default::default()
+                                });
                             } else if _state.channel_info(chan_id).await.is_none() {
-                                let mut pd = PermissionDenied::default();
-                                pd.r#type = Some(PermissionDenyType::Permission as i32);
-                                pd.reason = Some("Unknown channel".to_string());
-                                pd.session = Some(session);
-                                pd.channel_id = Some(chan_id);
-                                denial = Some(pd);
+                                denial = Some(PermissionDenied {
+                                    r#type: Some(PermissionDenyType::Permission as i32),
+                                    reason: Some("Unknown channel".to_string()),
+                                    session: Some(session),
+                                    channel_id: Some(chan_id),
+                                    ..Default::default()
+                                });
                             } else {
-                                let mut out = TextMessage::default();
-                                out.actor = Some(session);
-                                out.message = tm.message.clone();
-                                out.channel_id = vec![chan_id];
+                                let out = TextMessage {
+                                    actor: Some(session),
+                                    message: tm.message.clone(),
+                                    channel_id: vec![chan_id],
+                                    ..Default::default()
+                                };
                                 let sent = _state
                                     .broadcast_channel(
                                         chan_id,
@@ -386,11 +407,12 @@ pub async fn handle_connection(
                             }
                         }
                         (None, Some(_)) => {
-                            let mut pd = PermissionDenied::default();
-                            pd.r#type = Some(PermissionDenyType::Permission as i32);
-                            pd.reason = Some("Unknown session".to_string());
-                            pd.session = Some(session);
-                            denial = Some(pd);
+                            denial = Some(PermissionDenied {
+                                r#type: Some(PermissionDenyType::Permission as i32),
+                                reason: Some("Unknown session".to_string()),
+                                session: Some(session),
+                                ..Default::default()
+                            });
                         }
                     }
                 }
@@ -398,11 +420,12 @@ pub async fn handle_connection(
                 let denial_message = if let Some(pd) = denial {
                     Some(MumbleMessage::PermissionDenied(pd))
                 } else if !delivered {
-                    let mut pd = PermissionDenied::default();
-                    pd.r#type = Some(PermissionDenyType::Text as i32);
-                    pd.reason = Some("Invalid text target".to_string());
-                    pd.session = Some(session);
-                    Some(MumbleMessage::PermissionDenied(pd))
+                    Some(MumbleMessage::PermissionDenied(PermissionDenied {
+                        r#type: Some(PermissionDenyType::Text as i32),
+                        reason: Some("Invalid text target".to_string()),
+                        session: Some(session),
+                        ..Default::default()
+                    }))
                 } else {
                     None
                 };
@@ -439,8 +462,10 @@ pub async fn handle_connection(
     }
 
     if let Some(err) = send_failure {
-        let mut remove = UserRemove::default();
-        remove.session = session;
+        let remove = UserRemove {
+            session,
+            ..Default::default()
+        };
         let _ = _state
             .broadcast_except(session, MumbleMessage::UserRemove(remove))
             .await;
@@ -476,10 +501,11 @@ async fn handle_authenticated(
     }
 
     let cs = create_and_store_crypt(session, &state).await;
-    let mut crypt = CryptSetup::default();
-    crypt.key = Some(cs.key.to_vec());
-    crypt.server_nonce = Some(cs.server_nonce.to_vec());
-    crypt.client_nonce = Some(cs.client_nonce.to_vec());
+    let crypt = CryptSetup {
+        key: Some(cs.key.to_vec()),
+        server_nonce: Some(cs.server_nonce.to_vec()),
+        client_nonce: Some(cs.client_nonce.to_vec()),
+    };
     write_message(tls, &MumbleMessage::CryptSetup(crypt)).await?;
 
     let default_channel = state.default_channel_id().await;
@@ -488,21 +514,20 @@ async fn handle_authenticated(
         write_message(tls, &MumbleMessage::ChannelState(chan)).await?;
     }
 
-    let mut self_state = UserState::default();
-    self_state.session = Some(session);
-    self_state.name = Some(requested_name.clone());
-    self_state.channel_id = Some(default_channel);
+    let self_state = UserState {
+        session: Some(session),
+        name: Some(requested_name.clone()),
+        channel_id: Some(default_channel),
+        ..Default::default()
+    };
     write_message(tls, &MumbleMessage::UserState(self_state)).await?;
 
-    let mut sync = ServerSync::default();
-    sync.session = Some(session);
-    if let Some(text) = state.cfg.welcome_text.clone() {
-        sync.welcome_text = Some(text);
-    }
-    if let Some(bw) = state.cfg.max_bandwidth {
-        sync.max_bandwidth = Some(bw);
-    }
-    sync.permissions = Some(0xffff_ffffu64);
+    let sync = ServerSync {
+        session: Some(session),
+        welcome_text: state.cfg.welcome_text.clone(),
+        max_bandwidth: state.cfg.max_bandwidth,
+        permissions: Some(0xffff_ffffu64),
+    };
     write_message(tls, &MumbleMessage::ServerSync(sync)).await?;
 
     let existing_users = state.list_users().await;
@@ -518,26 +543,31 @@ async fn handle_authenticated(
         if u.session == session {
             continue;
         }
-        let mut ustate = UserState::default();
-        ustate.session = Some(u.session);
-        ustate.name = u.name.clone();
-        ustate.channel_id = Some(u.channel_id);
+        let ustate = UserState {
+            session: Some(u.session),
+            name: u.name.clone(),
+            channel_id: Some(u.channel_id),
+            ..Default::default()
+        };
         write_message(tls, &MumbleMessage::UserState(ustate)).await?;
     }
 
-    let mut newcomer = UserState::default();
-    newcomer.session = Some(session);
-    newcomer.name = Some(requested_name.clone());
-    newcomer.channel_id = Some(default_channel);
+    let newcomer = UserState {
+        session: Some(session),
+        name: Some(requested_name.clone()),
+        channel_id: Some(default_channel),
+        ..Default::default()
+    };
     let _ = state
         .broadcast_except(session, MumbleMessage::UserState(newcomer))
         .await;
 
-    let mut codec = CodecVersion::default();
-    codec.alpha = state.cfg.codec_alpha;
-    codec.beta = state.cfg.codec_beta;
-    codec.prefer_alpha = state.cfg.codec_prefer_alpha;
-    codec.opus = Some(state.cfg.enable_opus && auth.opus.unwrap_or(false));
+    let codec = CodecVersion {
+        alpha: state.cfg.codec_alpha,
+        beta: state.cfg.codec_beta,
+        prefer_alpha: state.cfg.codec_prefer_alpha,
+        opus: Some(state.cfg.enable_opus && auth.opus.unwrap_or(false)),
+    };
     write_message(tls, &MumbleMessage::CodecVersion(codec)).await?;
 
     Ok(session)
@@ -548,36 +578,26 @@ async fn send_reject(
     rtype: RejectType,
     reason: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut reject = Reject::default();
-    reject.r#type = Some(rtype as i32);
-    reject.reason = Some(reason.to_string());
+    let reject = Reject {
+        r#type: Some(rtype as i32),
+        reason: Some(reason.to_string()),
+    };
     write_message(tls, &MumbleMessage::Reject(reject)).await?;
     Ok(())
 }
 
 fn make_channel_state(info: &ChannelInfo) -> ChannelState {
-    let mut chan = ChannelState::default();
-    chan.channel_id = Some(info.id);
-    if let Some(parent) = info.parent {
-        chan.parent = Some(parent);
+    ChannelState {
+        channel_id: Some(info.id),
+        parent: info.parent,
+        name: Some(info.name.clone()),
+        description: info.description.clone(),
+        position: info.position,
+        max_users: info.max_users,
+        is_enter_restricted: Some(info.no_enter),
+        can_enter: Some(!info.no_enter),
+        ..Default::default()
     }
-    chan.name = Some(info.name.clone());
-    if let Some(desc) = info.description.as_ref() {
-        chan.description = Some(desc.clone());
-    }
-    if let Some(pos) = info.position {
-        chan.position = Some(pos);
-    }
-    if let Some(max) = info.max_users {
-        chan.max_users = Some(max);
-    }
-    if info.no_enter {
-        chan.is_enter_restricted = Some(true);
-        chan.can_enter = Some(false);
-    } else {
-        chan.can_enter = Some(true);
-    }
-    chan
 }
 
 async fn spawn_writer_task(
@@ -757,7 +777,7 @@ async fn handle_udp_datagram(
     data: Vec<u8>,
     addr: SocketAddr,
 ) -> Result<(), String> {
-    let first_byte = data.get(0).copied().unwrap_or(0);
+    let first_byte = data.first().copied().unwrap_or(0);
     tracing::debug!(%addr, size = data.len(), first_byte, "server: udp datagram received");
     if try_handle_unencrypted_ping(state, &socket, &data, addr).await? {
         return Ok(());
@@ -811,9 +831,8 @@ async fn respond_legacy_udp_probe(
     let copy_len = data.len().min(reply.len());
     reply[..copy_len].copy_from_slice(&data[..copy_len]);
 
-    let version_v1 = ((PROTOCOL_VERSION.0 as u32) << 16)
-        | ((PROTOCOL_VERSION.1 as u32) << 8)
-        | (PROTOCOL_VERSION.2.min(255) as u32);
+    let version_v1 =
+        (PROTOCOL_VERSION.0 << 16) | (PROTOCOL_VERSION.1 << 8) | PROTOCOL_VERSION.2.min(255);
     reply[0..4].copy_from_slice(&version_v1.to_be_bytes());
 
     let users = state.list_users().await;
@@ -854,17 +873,22 @@ async fn respond_proto_udp_probe(
 ) -> Result<bool, String> {
     match udp_proto::Ping::decode(payload) {
         Ok(request) => {
-            let mut reply = udp_proto::Ping::default();
-            reply.timestamp = request.timestamp;
-            reply.server_version_v2 = protocol_version_v2();
-            if request.request_extended_information {
-                let users = state.list_users().await;
-                reply.user_count = users.len() as u32;
-                reply.max_user_count = 0;
-                if let Some(bw) = state.cfg.max_bandwidth {
-                    reply.max_bandwidth_per_user = bw;
-                }
-            }
+            let (user_count, max_user_count, max_bandwidth_per_user) =
+                if request.request_extended_information {
+                    let users = state.list_users().await;
+                    (users.len() as u32, 0, state.cfg.max_bandwidth.unwrap_or(0))
+                } else {
+                    (0, 0, 0)
+                };
+
+            let reply = udp_proto::Ping {
+                timestamp: request.timestamp,
+                server_version_v2: protocol_version_v2(),
+                user_count,
+                max_user_count,
+                max_bandwidth_per_user,
+                ..Default::default()
+            };
             let mut out = reply.encode_to_vec();
             out.insert(0, UDP_MSG_TYPE_PING);
             socket
@@ -993,8 +1017,10 @@ async fn maybe_request_resync(
         return;
     }
     if let Some(crypt) = state.get_crypt(session).await {
-        let mut setup = CryptSetup::default();
-        setup.server_nonce = Some(crypt.server_nonce.to_vec());
+        let setup = CryptSetup {
+            server_nonce: Some(crypt.server_nonce.to_vec()),
+            ..Default::default()
+        };
         let sent = state
             .send_to(session, MumbleMessage::CryptSetup(setup))
             .await;
@@ -1078,10 +1104,14 @@ mod udp_probe_tests {
         data[1] = 0xaa;
         data[2] = 0xbb;
 
-        let handled =
-            try_handle_unencrypted_ping(&state, &server_sock, &data, client_sock.local_addr().unwrap())
-                .await
-                .unwrap();
+        let handled = try_handle_unencrypted_ping(
+            &state,
+            &server_sock,
+            &data,
+            client_sock.local_addr().unwrap(),
+        )
+        .await
+        .unwrap();
         assert!(!handled);
         assert_no_udp_reply(&client_sock).await;
     }
@@ -1093,10 +1123,14 @@ mod udp_probe_tests {
         let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         let data = vec![0u8; 12];
-        let handled =
-            try_handle_unencrypted_ping(&state, &server_sock, &data, client_sock.local_addr().unwrap())
-                .await
-                .unwrap();
+        let handled = try_handle_unencrypted_ping(
+            &state,
+            &server_sock,
+            &data,
+            client_sock.local_addr().unwrap(),
+        )
+        .await
+        .unwrap();
         assert!(handled);
 
         let mut buf = [0u8; 2048];
@@ -1204,12 +1238,10 @@ async fn handle_tunnel_datagram(
             .await;
         }
     } else if datagram[0] == UDP_MSG_TYPE_PING {
-        if udp_proto::Ping::decode(&datagram[1..]).is_ok() {
+        if let Ok(mut ping) = udp_proto::Ping::decode(&datagram[1..]) {
             state
                 .set_tcp_tunnel_mode(session, TcpTunnelMode::Plain)
                 .await;
-            let mut ping = udp_proto::Ping::decode(&datagram[1..])
-                .map_err(|err| format!("decode ping failed: {err}"))?;
             tracing::debug!(session, ts=?ping.timestamp, "server: tunneled udp ping received");
             if ping.request_extended_information {
                 let users = state.list_users().await;
@@ -1241,7 +1273,9 @@ async fn handle_tunnel_datagram(
     let udp_socket = udp_socket.as_ref();
 
     match plain[0] {
-        UDP_MSG_TYPE_AUDIO => handle_udp_audio(&state, udp_socket, session, &plain[1..], metrics).await,
+        UDP_MSG_TYPE_AUDIO => {
+            handle_udp_audio(&state, udp_socket, session, &plain[1..], metrics).await
+        }
         UDP_MSG_TYPE_PING => {
             let mut ping = udp_proto::Ping::decode(&plain[1..])
                 .map_err(|err| format!("decode ping failed: {err}"))?;
@@ -1261,7 +1295,11 @@ async fn handle_tunnel_datagram(
                 .map_err(|err| err.to_string())
         }
         other => {
-            tracing::debug!(session, ty = other, "server: unknown tunneled UDP message type");
+            tracing::debug!(
+                session,
+                ty = other,
+                "server: unknown tunneled UDP message type"
+            );
             Ok(())
         }
     }
@@ -1314,7 +1352,7 @@ async fn handle_udp_audio(
         Some(audio.frame_number)
     };
 
-    let header = match audio.header.clone() {
+    let header = match audio.header {
         Some(h) => h,
         None => {
             tracing::debug!(session, "server: audio packet missing header");
@@ -1467,9 +1505,9 @@ async fn encrypt_udp_plain(
     };
     let encrypted = {
         let mut guard = crypt_arc.lock().await;
-        guard.encrypt(payload).map_err(|err| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("encrypt failed: {err}"))
-        })?
+        guard
+            .encrypt(payload)
+            .map_err(|err| std::io::Error::other(format!("encrypt failed: {err}")))?
     };
     Ok(encrypted)
 }

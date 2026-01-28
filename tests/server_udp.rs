@@ -1,6 +1,6 @@
 use mumblers::{
     server::{MumbleServer, ServerConfig},
-    ConnectionConfig, MumbleConnection, MumbleEvent,
+    ConnectionConfig, MumbleConnection,
 };
 use rcgen::generate_simple_self_signed;
 use std::sync::Arc;
@@ -52,7 +52,7 @@ async fn cryptsetup_after_auth_and_resync() {
     assert_eq!(udp.server_nonce.len(), 16);
 
     // Trigger resync by sending a CryptSetup with a new client_nonce directly over TCP
-    use mumblers::messages::{read_envelope, write_message, MumbleMessage};
+    use mumblers::messages::MumbleMessage;
     use mumblers::proto::mumble::CryptSetup;
 
     // We don't have direct writer access; reuse the connection's internal send_message
