@@ -5,8 +5,10 @@ edition = "2021"
 license = "MIT"
 
 [features]
-default = []
+default = ["config"]
 audio = ["opus"]
+config = ["serde", "toml"]
+server-bin = ["rcgen", "config"]
 
 [dependencies]
 bytes = "1"
@@ -21,20 +23,25 @@ aes = "0.8"
 cipher = "0.4"
 rand = "0.8"
 opus = { version = "0.3", optional = true }
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+serde = { version = "1", features = ["derive"], optional = true }
+toml = { version = "0.8", optional = true }
 rustls-pemfile = "2"
 clap = { version = "4", features = ["derive"] }
-rcgen = "0.12"
+rcgen = { version = "0.12", optional = true }
 
 [build-dependencies]
 prost-build = "0.14"
 protoc-bin-vendored = "3.1"
 
+[[bin]]
+name = "mumblersd"
+required-features = ["server-bin"]
+
 [dev-dependencies]
 hound = "3"
 tokio-rustls = "0.25"
 rustls = "0.23"
+rcgen = "0.12"
 
 [[example]]
 name = "playback"
@@ -55,3 +62,7 @@ name = "events_udp"
 
 [[example]]
 name = "ping"
+
+[[example]]
+name = "server_stub"
+required-features = ["server-bin"]

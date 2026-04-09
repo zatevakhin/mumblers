@@ -1,23 +1,23 @@
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "config", derive(serde::Deserialize, serde::Serialize))]
 pub struct ChannelConfig {
     pub name: String,
-    #[serde(default)]
+    #[cfg_attr(feature = "config", serde(default))]
     pub parent: Option<String>,
-    #[serde(default)]
+    #[cfg_attr(feature = "config", serde(default))]
     pub description: Option<String>,
-    #[serde(default)]
+    #[cfg_attr(feature = "config", serde(default))]
     pub position: Option<i32>,
-    #[serde(default)]
+    #[cfg_attr(feature = "config", serde(default))]
     pub max_users: Option<u32>,
-    #[serde(default)]
+    #[cfg_attr(feature = "config", serde(default))]
     pub noenter: Option<bool>,
-    #[serde(default)]
+    #[cfg_attr(feature = "config", serde(default))]
     pub silent: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "config", derive(serde::Deserialize, serde::Serialize))]
 pub struct ServerConfig {
     pub bind_host: String,
     pub bind_port: u16,
@@ -28,19 +28,19 @@ pub struct ServerConfig {
     pub welcome_text: Option<String>,
     pub max_bandwidth: Option<u32>,
     pub allow_anonymous: Option<bool>,
-    #[serde(default = "default_channel_name")]
+    #[cfg_attr(feature = "config", serde(default = "default_channel_name"))]
     pub default_channel: String,
-    #[serde(default)]
+    #[cfg_attr(feature = "config", serde(default))]
     pub channels: Vec<ChannelConfig>,
-    #[serde(default = "default_codec_alpha")]
+    #[cfg_attr(feature = "config", serde(default = "default_codec_alpha"))]
     pub codec_alpha: i32,
-    #[serde(default = "default_codec_beta")]
+    #[cfg_attr(feature = "config", serde(default = "default_codec_beta"))]
     pub codec_beta: i32,
-    #[serde(default = "default_codec_prefer_alpha")]
+    #[cfg_attr(feature = "config", serde(default = "default_codec_prefer_alpha"))]
     pub codec_prefer_alpha: bool,
-    #[serde(default = "default_enable_opus")]
+    #[cfg_attr(feature = "config", serde(default = "default_enable_opus"))]
     pub enable_opus: bool,
-    #[serde(default)]
+    #[cfg_attr(feature = "config", serde(default))]
     pub max_users: Option<u32>,
 }
 
@@ -87,6 +87,7 @@ fn default_enable_opus() -> bool {
     true
 }
 
+#[cfg(feature = "config")]
 impl ServerConfig {
     pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
         let mut cfg: ServerConfig = toml::from_str(s)?;
