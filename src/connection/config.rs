@@ -49,6 +49,12 @@ pub struct ConnectionConfig {
     pub client_type: ClientType,
     /// Enable UDP voice tunnel negotiation once CryptSetup is received.
     pub enable_udp: bool,
+    /// Enable automatic reconnection on disconnect.
+    pub reconnect: bool,
+    /// Interval between reconnection attempts.
+    pub reconnect_interval: Duration,
+    /// Maximum number of reconnection attempts (None = unlimited).
+    pub max_reconnect_attempts: Option<u32>,
 }
 
 fn normalize_host_and_port(raw: &str) -> (String, Option<u16>) {
@@ -101,6 +107,9 @@ impl ConnectionConfig {
             tokens: Vec::new(),
             client_type: ClientType::Bot,
             enable_udp: false,
+            reconnect: false,
+            reconnect_interval: Duration::from_secs(10),
+            max_reconnect_attempts: None,
         }
     }
 
@@ -188,6 +197,24 @@ impl ConnectionConfigBuilder {
     /// Enable or disable UDP voice tunnel negotiation.
     pub fn enable_udp(mut self, enable: bool) -> Self {
         self.config.enable_udp = enable;
+        self
+    }
+
+    /// Enable automatic reconnection on disconnect.
+    pub fn reconnect(mut self, enable: bool) -> Self {
+        self.config.reconnect = enable;
+        self
+    }
+
+    /// Set the interval between reconnection attempts.
+    pub fn reconnect_interval(mut self, interval: Duration) -> Self {
+        self.config.reconnect_interval = interval;
+        self
+    }
+
+    /// Set the maximum number of reconnection attempts (None = unlimited).
+    pub fn max_reconnect_attempts(mut self, max: Option<u32>) -> Self {
+        self.config.max_reconnect_attempts = max;
         self
     }
 

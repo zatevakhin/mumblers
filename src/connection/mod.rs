@@ -91,6 +91,8 @@ pub enum MumbleEvent {
     Disconnected {
         reason: String,
     },
+    /// Connection was re-established after a disconnect.
+    Reconnected,
     Other(MumbleMessage),
     Unknown(MessageEnvelope),
 }
@@ -310,7 +312,131 @@ impl MumbleConnection {
         }
 
         self.spawn_connection_task(tls_stream).await?;
+
+        if self.config.reconnect {
+            self.spawn_reconnect_task();
+        }
+
         Ok(())
+    }
+
+    /// Manually trigger a reconnection attempt.
+    ///
+    /// Resets the internal state and re-establishes the connection.
+    pub async fn reconnect(&mut self) -> Result<(), MumbleError> {
+        // Abort existing tasks
+        if let Some(handle) = self.connection_task.take() {
+            handle.abort();
+        }
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(true);
+        }
+        self.command_tx = None;
+
+        // Reset client state but preserve config
+        {
+            let mut state = self.shared_state.lock().await;
+            *state = ClientState::default();
+        }
+
+        // Re-establish connection
+        self.connect().await
+    }
+
+    fn spawn_reconnect_task(&self) {
+        let shared_state = Arc::clone(&self.shared_state);
+        let event_tx = self.event_tx.clone();
+        let config = self.config.clone();
+
+        let mut rx = self.event_tx.subscribe();
+        let reconnect_interval = config.reconnect_interval;
+        let max_attempts = config.max_reconnect_attempts;
+
+        tokio::spawn(async move {
+            loop {
+                // Wait for a Disconnected event
+                match rx.recv().await {
+                    Ok(MumbleEvent::Disconnected { reason }) => {
+                        tracing::info!(reason, "client: disconnected, will attempt reconnection");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    _ => continue,
+                }
+
+                let mut attempt = 0u32;
+                loop {
+                    if let Some(max) = max_attempts {
+                        if attempt >= max {
+                            tracing::warn!(
+                                attempt,
+                                max,
+                                "client: max reconnection attempts reached"
+                            );
+                            let _ = event_tx.send(MumbleEvent::Disconnected {
+                                reason: "max reconnection attempts reached".to_string(),
+                            });
+                            return; // stop the reconnect task entirely
+                        }
+                    }
+
+                    attempt += 1;
+                    tracing::info!(attempt, "client: reconnection attempt");
+                    tokio::time::sleep(reconnect_interval).await;
+
+                    // Reset state
+                    {
+                        let mut state = shared_state.lock().await;
+                        *state = ClientState::default();
+                    }
+
+                    // Try to re-establish TCP + TLS
+                    let tcp_future = TcpStream::connect((config.host.as_str(), config.port));
+                    let tcp_stream = match timeout(config.connect_timeout, tcp_future).await {
+                        Ok(Ok(s)) => s,
+                        _ => {
+                            tracing::warn!(attempt, "client: reconnect TCP failed");
+                            continue;
+                        }
+                    };
+                    let _ = tcp_stream.set_nodelay(true);
+
+                    let connector = match create_tls_connector(config.accept_invalid_certs) {
+                        Ok(c) => c,
+                        Err(err) => {
+                            tracing::warn!(attempt, error=?err, "client: reconnect TLS setup failed");
+                            continue;
+                        }
+                    };
+
+                    let server_name_str = config.tls_server_name.as_deref().unwrap_or(&config.host);
+                    let server_name = match ServerName::try_from(server_name_str.to_string()) {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+
+                    let mut tls_stream = match connector.connect(server_name, tcp_stream).await {
+                        Ok(s) => s,
+                        Err(err) => {
+                            tracing::warn!(attempt, error=?err, "client: reconnect TLS failed");
+                            continue;
+                        }
+                    };
+
+                    // Re-do handshake
+                    if send_version(&mut tls_stream).await.is_err() {
+                        continue;
+                    }
+                    if send_authenticate(&mut tls_stream, &config).await.is_err() {
+                        continue;
+                    }
+
+                    tracing::info!(attempt, "client: reconnected successfully");
+                    let _ = event_tx.send(MumbleEvent::Reconnected);
+                    break;
+                }
+            }
+        });
     }
 
     /// Return the connection configuration.
