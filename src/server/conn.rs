@@ -499,6 +499,14 @@ async fn handle_authenticated(
         return Err(Box::new(HandshakeRejected));
     }
 
+    if let Some(ref server_pw) = state.cfg.password {
+        let client_pw = auth.password.as_deref().unwrap_or("");
+        if client_pw != server_pw {
+            send_reject(tls, RejectType::WrongServerPw, "Invalid server password").await?;
+            return Err(Box::new(HandshakeRejected));
+        }
+    }
+
     if let Some(max) = state.cfg.max_users {
         if state.user_count().await >= max as usize {
             send_reject(tls, RejectType::ServerFull, "Server is full").await?;

@@ -291,3 +291,56 @@ async fn server_rejects_empty_username_when_anonymous_disabled() {
 // because the client itself rejects empty usernames before connecting.
 // The server's allow_anonymous path assigns "GuestN" names for empty usernames
 // that arrive over the wire (e.g. from other Mumble clients).
+
+#[tokio::test]
+async fn server_rejects_wrong_password() {
+    common::init_tracing();
+
+    let mut cfg = ServerConfig::default();
+    cfg.password = Some("secret123".to_string());
+    let (port, _handle) = start_server_with_config(cfg).await;
+    sleep(Duration::from_millis(200)).await;
+
+    // Wrong password should be rejected
+    let cfg_a = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("alice")
+        .password("wrongpass")
+        .accept_invalid_certs(true)
+        .build();
+    let mut client = MumbleConnection::new(cfg_a);
+    let result = client.connect().await;
+    assert!(result.is_err(), "wrong password should be rejected");
+}
+
+#[tokio::test]
+async fn server_accepts_correct_password() {
+    common::init_tracing();
+
+    let mut cfg = ServerConfig::default();
+    cfg.password = Some("secret123".to_string());
+    let (port, _handle) = start_server_with_config(cfg).await;
+    sleep(Duration::from_millis(200)).await;
+
+    let cfg_a = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("alice")
+        .password("secret123")
+        .accept_invalid_certs(true)
+        .build();
+    let mut client = MumbleConnection::new(cfg_a);
+    let mut events = client.subscribe_events();
+    client
+        .connect()
+        .await
+        .expect("correct password should be accepted");
+    let session = client.state().await.session_id.expect("session");
+    assert!(
+        wait_for_event(&mut events, Duration::from_secs(5), |ev| {
+            matches!(ev, MumbleEvent::ServerSync(sync) if sync.session == Some(session))
+        })
+        .await
+        .is_some(),
+        "should receive ServerSync with correct password"
+    );
+}

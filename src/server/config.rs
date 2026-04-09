@@ -42,6 +42,8 @@ pub struct ServerConfig {
     pub enable_opus: bool,
     #[cfg_attr(feature = "config", serde(default))]
     pub max_users: Option<u32>,
+    #[cfg_attr(feature = "config", serde(default))]
+    pub password: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -63,6 +65,7 @@ impl Default for ServerConfig {
             codec_prefer_alpha: default_codec_prefer_alpha(),
             enable_opus: default_enable_opus(),
             max_users: None,
+            password: None,
         }
     }
 }
