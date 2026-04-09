@@ -45,8 +45,10 @@ async fn start_server() -> (u16, tokio::task::JoinHandle<()>) {
     cfg.udp_bind_port = 40000 + (rand::random::<u16>() % 20000);
     let tls = make_tls();
     let server = MumbleServer::new(cfg, tls);
+    let shutdown = server.serve().await.expect("server serve");
     let handle = tokio::spawn(async move {
-        let _ = server.serve().await;
+        let _shutdown = shutdown;
+        std::future::pending::<()>().await;
     });
     (port, handle)
 }

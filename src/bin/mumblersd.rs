@@ -77,22 +77,14 @@ async fn serve(config_path: &Path) -> Result<(), Box<dyn std::error::Error + Sen
     );
 
     let server = MumbleServer::new(cfg, tls);
-    let mut handle = tokio::spawn(async move { server.serve().await });
+    let shutdown = server.serve().await?;
 
-    tokio::select! {
-        result = &mut handle => {
-            match result {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(err)) => Err(err),
-                Err(err) => Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>),
-            }
-        }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("shutdown requested");
-            handle.abort();
-            Ok(())
-        }
-    }
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("shutdown requested");
+    shutdown.shutdown();
+    // Give connections a moment to clean up
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    Ok(())
 }
 
 fn show_config(path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

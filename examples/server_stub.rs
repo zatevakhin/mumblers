@@ -80,6 +80,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let tls = load_dev_tls(&cfg);
     let server = MumbleServer::new(cfg, tls);
-    server.serve().await.unwrap();
+    let shutdown = server.serve().await.unwrap();
+    tokio::signal::ctrl_c().await?;
+    shutdown.shutdown();
     Ok(())
 }

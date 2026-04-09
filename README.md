@@ -46,7 +46,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key)?;
     let server = MumbleServer::new(cfg, Arc::new(tls));
-    server.serve().await?;
+    let shutdown = server.serve().await?;
+    tokio::signal::ctrl_c().await?;
+    shutdown.shutdown();
     Ok(())
 }
 ```

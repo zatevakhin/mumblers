@@ -34,8 +34,11 @@ pub async fn start_server_with_config(mut cfg: ServerConfig) -> (u16, tokio::tas
     cfg.udp_bind_port = port;
     let tls = make_tls();
     let server = MumbleServer::new(cfg, tls);
+    let shutdown = server.serve().await.expect("server serve");
+    // Return a JoinHandle that keeps the shutdown handle alive until aborted
     let handle = tokio::spawn(async move {
-        let _ = server.serve().await;
+        let _shutdown = shutdown;
+        std::future::pending::<()>().await;
     });
     (port, handle)
 }
