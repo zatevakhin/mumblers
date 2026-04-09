@@ -537,3 +537,233 @@ async fn voice_udp_sender_reaches_tcp_only_receiver() {
 
     panic!("bob should receive tunneled audio from udp sender");
 }
+
+/// Helper to connect three clients (alice, bob, carol) all in the same default channel.
+async fn connect_trio() -> (
+    MumbleConnection,
+    MumbleConnection,
+    MumbleConnection,
+    u32,
+    u32,
+    u32,
+) {
+    let (port, _handle) = start_server().await;
+    sleep(Duration::from_millis(200)).await;
+
+    let mut clients = Vec::new();
+    let mut sessions = Vec::new();
+    for name in &["alice", "bob", "carol"] {
+        let cfg = ConnectionConfig::builder("127.0.0.1")
+            .port(port)
+            .username(*name)
+            .accept_invalid_certs(true)
+            .enable_udp(true)
+            .build();
+        let mut conn = MumbleConnection::new(cfg);
+        let mut events = conn.subscribe_events();
+        conn.connect().await.unwrap_or_else(|e| panic!("{name} connect: {e}"));
+        sleep(Duration::from_millis(300)).await;
+        let session = conn.state().await.session_id.expect(&format!("{name} session"));
+        assert!(
+            wait_for_event(&mut events, Duration::from_secs(5), |ev| matches!(
+                ev,
+                MumbleEvent::ServerSync(ServerSync { session: Some(id), .. }) if *id == session
+            ))
+            .await
+            .is_some(),
+            "{name} should receive ServerSync"
+        );
+        conn.wait_for_udp_ready(Some(Duration::from_secs(5)))
+            .await
+            .unwrap_or_else(|e| panic!("{name} udp ready: {e}"));
+        clients.push(conn);
+        sessions.push(session);
+    }
+
+    let mut drain = clients.drain(..);
+    let alice = drain.next().unwrap();
+    let bob = drain.next().unwrap();
+    let carol = drain.next().unwrap();
+    (alice, bob, carol, sessions[0], sessions[1], sessions[2])
+}
+
+#[tokio::test]
+async fn voice_whisper_to_specific_user() {
+    init_tracing();
+
+    let (alice, bob, carol, alice_session, bob_session, _carol_session) = connect_trio().await;
+
+    // Alice registers voice target 5 to whisper only to Bob.
+    use mumblers::proto::mumble::{VoiceTarget, voice_target::Target};
+    let vt = VoiceTarget {
+        id: Some(5),
+        targets: vec![Target {
+            session: vec![bob_session],
+            channel_id: None,
+            group: None,
+            links: None,
+            children: None,
+        }],
+    };
+    alice
+        .send_message(MumbleMessage::VoiceTarget(vt))
+        .await
+        .expect("alice registers voice target");
+    sleep(Duration::from_millis(100)).await;
+
+    let mut bob_rx = bob.subscribe_events();
+    let mut carol_rx = carol.subscribe_events();
+    while let Ok(_) = bob_rx.try_recv() {}
+    while let Ok(_) = carol_rx.try_recv() {}
+
+    // Alice sends audio with target=5 (whisper to Bob only)
+    let packet = VoicePacket {
+        header: AudioHeader::Target(5),
+        sender_session: None,
+        frame_number: 100,
+        opus_data: vec![42, 43, 44],
+        positional_data: None,
+        volume_adjustment: None,
+        is_terminator: false,
+    };
+
+    for _ in 0..5 {
+        alice.send_audio(packet.clone()).await.expect("alice sends whisper");
+        sleep(Duration::from_millis(30)).await;
+    }
+
+    // Bob should receive the whispered audio
+    let bob_audio = wait_for_event(&mut bob_rx, Duration::from_secs(3), |ev| {
+        matches!(ev, MumbleEvent::UdpAudio(_))
+    })
+    .await;
+    assert!(
+        bob_audio.is_some(),
+        "bob should receive whispered audio from alice"
+    );
+    if let Some(MumbleEvent::UdpAudio(recv)) = bob_audio {
+        assert_eq!(recv.sender_session, Some(alice_session));
+        assert_eq!(recv.opus_data, vec![42, 43, 44]);
+    }
+
+    // Carol should NOT receive the whispered audio
+    let carol_audio = wait_for_event(&mut carol_rx, Duration::from_secs(1), |ev| {
+        matches!(ev, MumbleEvent::UdpAudio(_))
+    })
+    .await;
+    assert!(
+        carol_audio.is_none(),
+        "carol should NOT receive whispered audio meant for bob"
+    );
+}
+
+#[tokio::test]
+async fn voice_whisper_to_channel() {
+    init_tracing();
+
+    let (port, _handle) = start_server().await;
+    sleep(Duration::from_millis(200)).await;
+
+    // Connect alice and bob to default channel (Lobby), carol stays in Root
+    let cfg_a = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("alice")
+        .accept_invalid_certs(true)
+        .enable_udp(true)
+        .build();
+    let mut alice = MumbleConnection::new(cfg_a);
+    let mut alice_events = alice.subscribe_events();
+    alice.connect().await.expect("alice connect");
+    sleep(Duration::from_millis(300)).await;
+    let alice_session = alice.state().await.session_id.expect("alice session");
+    assert!(
+        wait_for_event(&mut alice_events, Duration::from_secs(5), |ev| matches!(
+            ev,
+            MumbleEvent::ServerSync(ServerSync { session: Some(id), .. }) if *id == alice_session
+        ))
+        .await
+        .is_some()
+    );
+    alice
+        .wait_for_udp_ready(Some(Duration::from_secs(5)))
+        .await
+        .expect("alice udp ready");
+
+    let cfg_b = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("bob")
+        .accept_invalid_certs(true)
+        .enable_udp(true)
+        .build();
+    let mut bob = MumbleConnection::new(cfg_b);
+    let mut bob_events = bob.subscribe_events();
+    bob.connect().await.expect("bob connect");
+    sleep(Duration::from_millis(300)).await;
+    let bob_session = bob.state().await.session_id.expect("bob session");
+    assert!(
+        wait_for_event(&mut bob_events, Duration::from_secs(5), |ev| matches!(
+            ev,
+            MumbleEvent::ServerSync(ServerSync { session: Some(id), .. }) if *id == bob_session
+        ))
+        .await
+        .is_some()
+    );
+    bob.wait_for_udp_ready(Some(Duration::from_secs(5)))
+        .await
+        .expect("bob udp ready");
+
+    // Move bob to Root channel (channel_id=0)
+    bob.move_user_to_channel(bob_session, 0).await.expect("bob move to root");
+    sleep(Duration::from_millis(200)).await;
+
+    // Alice registers voice target 3 to whisper to Root channel (channel_id=0)
+    use mumblers::proto::mumble::{VoiceTarget, voice_target::Target};
+    let vt = VoiceTarget {
+        id: Some(3),
+        targets: vec![Target {
+            session: vec![],
+            channel_id: Some(0), // Root channel
+            group: None,
+            links: None,
+            children: None,
+        }],
+    };
+    alice
+        .send_message(MumbleMessage::VoiceTarget(vt))
+        .await
+        .expect("alice registers channel voice target");
+    sleep(Duration::from_millis(100)).await;
+
+    let mut bob_rx = bob.subscribe_events();
+    while let Ok(_) = bob_rx.try_recv() {}
+
+    // Alice sends audio with target=3 (whisper to Root channel)
+    let packet = VoicePacket {
+        header: AudioHeader::Target(3),
+        sender_session: None,
+        frame_number: 200,
+        opus_data: vec![55, 66, 77],
+        positional_data: None,
+        volume_adjustment: None,
+        is_terminator: false,
+    };
+
+    for _ in 0..5 {
+        alice.send_audio(packet.clone()).await.expect("alice sends channel whisper");
+        sleep(Duration::from_millis(30)).await;
+    }
+
+    // Bob (in Root) should receive the whispered audio
+    let bob_audio = wait_for_event(&mut bob_rx, Duration::from_secs(3), |ev| {
+        matches!(ev, MumbleEvent::UdpAudio(_))
+    })
+    .await;
+    assert!(
+        bob_audio.is_some(),
+        "bob (in Root channel) should receive channel-whispered audio from alice"
+    );
+    if let Some(MumbleEvent::UdpAudio(recv)) = bob_audio {
+        assert_eq!(recv.sender_session, Some(alice_session));
+        assert_eq!(recv.opus_data, vec![55, 66, 77]);
+    }
+}

@@ -484,6 +484,7 @@ impl MumbleConnection {
                 MumbleMessage::Authenticate(_)
                 | MumbleMessage::Ping(_)
                 | MumbleMessage::UdpTunnel(_)
+                | MumbleMessage::VoiceTarget(_)
                 | MumbleMessage::Unknown(_) => {
                     // Ignore other handshake-time messages for now.
                 }

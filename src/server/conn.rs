@@ -449,6 +449,16 @@ pub async fn handle_connection(
                     tracing::debug!(session, error = %err, "server: tunneled UDP handling failed");
                 }
             }
+            Ok(MumbleMessage::VoiceTarget(vt)) => {
+                if let Some(target_id) = vt.id {
+                    if target_id >= 1 && target_id <= 30 {
+                        tracing::debug!(session, target_id, n_targets = vt.targets.len(), "server: voice target registered");
+                        _state.set_voice_targets(session, target_id, vt.targets).await;
+                    } else {
+                        tracing::debug!(session, target_id, "server: voice target id out of range");
+                    }
+                }
+            }
             Ok(_) => {}
             Err(err) => {
                 tracing::debug!(session, error=?err, "server: failed to decode message");
@@ -674,6 +684,7 @@ fn message_name(msg: &MumbleMessage) -> &'static str {
         MumbleMessage::TextMessage(_) => "TextMessage",
         MumbleMessage::PermissionDenied(_) => "PermissionDenied",
         MumbleMessage::CodecVersion(_) => "CodecVersion",
+        MumbleMessage::VoiceTarget(_) => "VoiceTarget",
         MumbleMessage::Unknown(_) => "Unknown",
     }
 }
@@ -1379,6 +1390,8 @@ async fn handle_udp_audio(
                 }
             } else if target == 0 {
                 route_channel_audio(state, udp_socket, session, &audio).await?;
+            } else if target >= 1 && target <= 30 {
+                route_voice_target(state, udp_socket, session, target, &audio).await?;
             } else {
                 tracing::debug!(session, target, "server: unsupported voice target");
             }
@@ -1438,6 +1451,41 @@ async fn route_channel_audio(
             tracing::debug!(session, target, error=%err, "server: failed to forward audio");
         }
     }
+    Ok(())
+}
+
+async fn route_voice_target(
+    state: &ServerState,
+    udp_socket: Option<&Arc<tokio::net::UdpSocket>>,
+    session: super::state::SessionId,
+    target_id: u32,
+    audio: &udp_proto::Audio,
+) -> Result<(), String> {
+    let recipients = state.resolve_voice_target(session, target_id).await;
+    if recipients.is_empty() {
+        tracing::debug!(session, target_id, "server: voice target resolved to no recipients");
+        return Ok(());
+    }
+
+    for target in recipients {
+        let mut packet = audio.clone();
+        // Whisper context: receivers see context indicating a whisper
+        packet.header = Some(udp_proto::audio::Header::Context(target_id));
+        packet.sender_session = session;
+        let mut payload = packet.encode_to_vec();
+        payload.insert(0, UDP_MSG_TYPE_AUDIO);
+        tracing::info!(
+            session,
+            target,
+            target_id,
+            frame = packet.frame_number,
+            "server: forwarding whisper audio"
+        );
+        if let Err(err) = send_voice_payload(state, udp_socket, target, &payload).await {
+            tracing::debug!(session, target, error=%err, "server: failed to forward whisper audio");
+        }
+    }
+
     Ok(())
 }
 

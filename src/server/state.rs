@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, RwLock};
 use super::config::{ChannelConfig, ServerConfig};
 use crate::crypto::ocb2::CryptStateOcb2;
 use crate::messages::MumbleMessage;
+use crate::proto::mumble::voice_target::Target as VoiceTargetEntry;
 
 pub type SessionId = u32;
 
@@ -89,6 +90,8 @@ struct InnerState {
     tcp_tunnel_mode: HashMap<SessionId, TcpTunnelMode>,
     voice_stats: HashMap<SessionId, VoiceStats>,
     last_resync_request: HashMap<SessionId, Instant>,
+    /// Per-session voice target storage: session -> (target_id -> targets).
+    voice_targets: HashMap<SessionId, HashMap<u32, Vec<VoiceTargetEntry>>>,
     channels: HashMap<u32, ChannelInfo>,
     channel_name_idx: HashMap<String, u32>,
     channel_members: HashMap<u32, HashSet<SessionId>>,
@@ -118,6 +121,7 @@ impl ServerState {
                 tcp_tunnel_mode: HashMap::new(),
                 voice_stats: HashMap::new(),
                 last_resync_request: HashMap::new(),
+                voice_targets: HashMap::new(),
                 channels,
                 channel_name_idx: name_idx,
                 channel_members: members,
@@ -215,6 +219,7 @@ impl ServerState {
         g.tcp_tunnel_mode.remove(&session);
         g.voice_stats.remove(&session);
         g.last_resync_request.remove(&session);
+        g.voice_targets.remove(&session);
     }
 
     pub async fn list_users(&self) -> Vec<UserInfo> {
@@ -466,6 +471,88 @@ impl ServerState {
             .unwrap_or_default()
     }
 
+    /// Store voice target entries for a given session and target ID (1-30).
+    pub async fn set_voice_targets(
+        &self,
+        session: SessionId,
+        target_id: u32,
+        targets: Vec<VoiceTargetEntry>,
+    ) {
+        let mut g = self.inner.write().await;
+        g.voice_targets
+            .entry(session)
+            .or_default()
+            .insert(target_id, targets);
+    }
+
+    /// Retrieve the raw voice target entries for a given session and target ID.
+    pub async fn get_voice_targets(
+        &self,
+        session: SessionId,
+        target_id: u32,
+    ) -> Option<Vec<VoiceTargetEntry>> {
+        let g = self.inner.read().await;
+        g.voice_targets
+            .get(&session)
+            .and_then(|m| m.get(&target_id))
+            .cloned()
+    }
+
+    /// Resolve a voice target into the set of recipient session IDs.
+    ///
+    /// Collects sessions from direct session targets and channel-based targets.
+    /// The sender is always excluded from the result.
+    pub async fn resolve_voice_target(
+        &self,
+        sender: SessionId,
+        target_id: u32,
+    ) -> HashSet<SessionId> {
+        let g = self.inner.read().await;
+        let mut recipients = HashSet::new();
+
+        let entries = match g.voice_targets.get(&sender).and_then(|m| m.get(&target_id)) {
+            Some(e) => e,
+            None => return recipients,
+        };
+
+        for entry in entries {
+            // Direct session whisper
+            for &sess in &entry.session {
+                if sess != sender {
+                    recipients.insert(sess);
+                }
+            }
+
+            // Channel-based whisper
+            if let Some(channel_id) = entry.channel_id {
+                if let Some(members) = g.channel_members.get(&channel_id) {
+                    for &sess in members {
+                        if sess != sender {
+                            recipients.insert(sess);
+                        }
+                    }
+                }
+
+                // If children flag is set, include members of child channels
+                if entry.children.unwrap_or(false) {
+                    for (cid, info) in &g.channels {
+                        if info.parent == Some(channel_id) {
+                            if let Some(members) = g.channel_members.get(cid) {
+                                for &sess in members {
+                                    if sess != sender {
+                                        recipients.insert(sess);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        recipients
+    }
+
     pub async fn record_voice_packet(
         &self,
         session: SessionId,
@@ -575,4 +662,158 @@ fn build_channels(cfg: &ServerConfig) -> ChannelBuild {
     };
 
     (channels, name_idx, members, default_channel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::mumble::voice_target::Target;
+    use crate::server::config::ServerConfig;
+
+    fn test_state() -> ServerState {
+        ServerState::new(ServerConfig::default())
+    }
+
+    #[tokio::test]
+    async fn set_and_get_voice_target() {
+        let state = test_state();
+        let session: SessionId = 1;
+
+        // Register a voice target with two session whispers
+        let targets = vec![Target {
+            session: vec![10, 20],
+            channel_id: None,
+            group: None,
+            links: None,
+            children: None,
+        }];
+        state.set_voice_targets(session, 5, targets.clone()).await;
+
+        let retrieved = state.get_voice_targets(session, 5).await;
+        assert!(retrieved.is_some(), "should retrieve stored targets");
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.len(), 1);
+        assert_eq!(retrieved[0].session, vec![10, 20]);
+    }
+
+    #[tokio::test]
+    async fn get_voice_target_missing_returns_none() {
+        let state = test_state();
+        assert!(state.get_voice_targets(1, 5).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn overwrite_voice_target() {
+        let state = test_state();
+        let session: SessionId = 1;
+
+        let targets_a = vec![Target {
+            session: vec![10],
+            channel_id: None,
+            group: None,
+            links: None,
+            children: None,
+        }];
+        state.set_voice_targets(session, 3, targets_a).await;
+
+        let targets_b = vec![Target {
+            session: vec![30, 40],
+            channel_id: None,
+            group: None,
+            links: None,
+            children: None,
+        }];
+        state.set_voice_targets(session, 3, targets_b).await;
+
+        let retrieved = state.get_voice_targets(session, 3).await.unwrap();
+        assert_eq!(retrieved.len(), 1);
+        assert_eq!(retrieved[0].session, vec![30, 40]);
+    }
+
+    #[tokio::test]
+    async fn clear_voice_targets_on_user_remove() {
+        let state = test_state();
+        let session = state.alloc_session().await;
+        let user = UserInfo {
+            session,
+            name: Some("alice".into()),
+            channel_id: 0,
+        };
+        state.add_user(user).await;
+
+        let targets = vec![Target {
+            session: vec![10],
+            channel_id: None,
+            group: None,
+            links: None,
+            children: None,
+        }];
+        state.set_voice_targets(session, 5, targets).await;
+        assert!(state.get_voice_targets(session, 5).await.is_some());
+
+        state.remove_user(session).await;
+        assert!(state.get_voice_targets(session, 5).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_voice_target_sessions() {
+        let state = test_state();
+        let session: SessionId = 1;
+
+        // Target with specific session IDs
+        let targets = vec![Target {
+            session: vec![10, 20, 30],
+            channel_id: None,
+            group: None,
+            links: None,
+            children: None,
+        }];
+        state.set_voice_targets(session, 5, targets).await;
+
+        let recipients = state.resolve_voice_target(session, 5).await;
+        assert_eq!(recipients.len(), 3);
+        assert!(recipients.contains(&10));
+        assert!(recipients.contains(&20));
+        assert!(recipients.contains(&30));
+    }
+
+    #[tokio::test]
+    async fn resolve_voice_target_channel() {
+        let state = test_state();
+        let sender: SessionId = 1;
+
+        // Put users 10 and 20 into channel 0 (Root)
+        for s in [10u32, 20] {
+            state
+                .add_user(UserInfo {
+                    session: s,
+                    name: Some(format!("user{s}")),
+                    channel_id: 0,
+                })
+                .await;
+        }
+
+        // Target channel 0
+        let targets = vec![Target {
+            session: vec![],
+            channel_id: Some(0),
+            group: None,
+            links: None,
+            children: None,
+        }];
+        state.set_voice_targets(sender, 2, targets).await;
+
+        let recipients = state.resolve_voice_target(sender, 2).await;
+        assert!(recipients.contains(&10));
+        assert!(recipients.contains(&20));
+        // Sender should not be in the result
+        assert!(!recipients.contains(&sender));
+    }
+
+    #[tokio::test]
+    async fn resolve_voice_target_missing_returns_empty() {
+        let state = test_state();
+        let recipients = state.resolve_voice_target(1, 99).await;
+        assert!(recipients.is_empty());
+    }
 }

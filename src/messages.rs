@@ -6,7 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proto::mumble::{
     Authenticate, ChannelRemove, ChannelState, CodecVersion, CryptSetup, PermissionDenied, Ping,
-    Reject, ServerSync, TextMessage, UdpTunnel, UserRemove, UserState, Version,
+    Reject, ServerSync, TextMessage, UdpTunnel, UserRemove, UserState, Version, VoiceTarget,
 };
 
 /// Protocol revision tuple (major, minor, patch) advertised to the server.
@@ -142,6 +142,8 @@ pub enum TcpMessageKind {
     PermissionDenied,
     /// Codec version negotiation.
     CodecVersion,
+    /// Voice target registration for whisper/shout.
+    VoiceTarget,
     /// Any message that does not yet have an explicit mapping.
     Unknown(u16),
 }
@@ -164,6 +166,7 @@ impl TcpMessageKind {
             12 => TcpMessageKind::PermissionDenied,
             21 => TcpMessageKind::CodecVersion,
             15 => TcpMessageKind::CryptSetup,
+            19 => TcpMessageKind::VoiceTarget,
             other => TcpMessageKind::Unknown(other),
         }
     }
@@ -185,6 +188,7 @@ impl TcpMessageKind {
             TcpMessageKind::PermissionDenied => 12,
             TcpMessageKind::CodecVersion => 21,
             TcpMessageKind::CryptSetup => 15,
+            TcpMessageKind::VoiceTarget => 19,
             TcpMessageKind::Unknown(value) => value,
         }
     }
@@ -298,6 +302,7 @@ pub enum MumbleMessage {
     TextMessage(TextMessage),
     PermissionDenied(crate::proto::mumble::PermissionDenied),
     CodecVersion(CodecVersion),
+    VoiceTarget(VoiceTarget),
     /// Message type not yet modeled by this enum.
     Unknown(MessageEnvelope),
 }
@@ -320,6 +325,7 @@ impl MumbleMessage {
             MumbleMessage::PermissionDenied(_) => TcpMessageKind::PermissionDenied,
             MumbleMessage::CryptSetup(_) => TcpMessageKind::CryptSetup,
             MumbleMessage::CodecVersion(_) => TcpMessageKind::CodecVersion,
+            MumbleMessage::VoiceTarget(_) => TcpMessageKind::VoiceTarget,
             MumbleMessage::Unknown(envelope) => envelope.kind,
         }
     }
@@ -346,6 +352,7 @@ impl MumbleMessage {
                 MessageEnvelope::try_from_message(self.kind(), msg)
             }
             MumbleMessage::CodecVersion(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
+            MumbleMessage::VoiceTarget(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
             MumbleMessage::Unknown(envelope) => Ok(envelope.clone()),
         }
     }
@@ -469,6 +476,12 @@ impl TryFrom<MessageEnvelope> for MumbleMessage {
                         source,
                     })?
             }
+            TcpMessageKind::VoiceTarget => VoiceTarget::decode(envelope.payload.as_slice())
+                .map(MumbleMessage::VoiceTarget)
+                .map_err(|source| MessageDecodeError::Decode {
+                    kind: TcpMessageKind::VoiceTarget,
+                    source,
+                })?,
             TcpMessageKind::Unknown(_) => MumbleMessage::Unknown(envelope),
         };
         Ok(result)
@@ -578,5 +591,57 @@ mod tests {
 
         let err = super::read_envelope(&mut rx).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn voice_target_kind_roundtrips_as_id_19() {
+        let kind = TcpMessageKind::VoiceTarget;
+        assert_eq!(kind.as_id(), 19);
+        assert_eq!(TcpMessageKind::from_id(19), TcpMessageKind::VoiceTarget);
+    }
+
+    #[test]
+    fn voice_target_message_roundtrip() {
+        use crate::proto::mumble::VoiceTarget;
+        use crate::proto::mumble::voice_target::Target;
+
+        let vt = VoiceTarget {
+            id: Some(5),
+            targets: vec![
+                Target {
+                    session: vec![10, 20],
+                    channel_id: None,
+                    group: None,
+                    links: None,
+                    children: None,
+                },
+                Target {
+                    session: vec![],
+                    channel_id: Some(3),
+                    group: None,
+                    links: Some(true),
+                    children: Some(true),
+                },
+            ],
+        };
+
+        let message = MumbleMessage::VoiceTarget(vt.clone());
+        assert_eq!(message.kind(), TcpMessageKind::VoiceTarget);
+
+        let envelope = message.encode().unwrap();
+        assert_eq!(envelope.kind, TcpMessageKind::VoiceTarget);
+
+        let decoded = MumbleMessage::try_from(envelope).unwrap();
+        match decoded {
+            MumbleMessage::VoiceTarget(decoded_vt) => {
+                assert_eq!(decoded_vt.id, Some(5));
+                assert_eq!(decoded_vt.targets.len(), 2);
+                assert_eq!(decoded_vt.targets[0].session, vec![10, 20]);
+                assert_eq!(decoded_vt.targets[1].channel_id, Some(3));
+                assert_eq!(decoded_vt.targets[1].links, Some(true));
+                assert_eq!(decoded_vt.targets[1].children, Some(true));
+            }
+            other => panic!("expected VoiceTarget, got {other:?}"),
+        }
     }
 }
