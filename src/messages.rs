@@ -602,8 +602,8 @@ mod tests {
 
     #[test]
     fn voice_target_message_roundtrip() {
-        use crate::proto::mumble::VoiceTarget;
         use crate::proto::mumble::voice_target::Target;
+        use crate::proto::mumble::VoiceTarget;
 
         let vt = VoiceTarget {
             id: Some(5),

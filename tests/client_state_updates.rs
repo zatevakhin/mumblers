@@ -82,11 +82,9 @@ async fn client_state_tracks_user_join_and_remove() {
     );
 
     let state = alice.state().await;
-    assert_eq!(
-        state.users.get(&bob_session).map(String::as_str),
-        Some("bob")
-    );
-    assert_eq!(state.user_channels.get(&bob_session), Some(&0));
+    let bob_info = state.users.get(&bob_session).expect("bob in state");
+    assert_eq!(bob_info.name.as_deref(), Some("bob"));
+    assert_eq!(bob_info.channel_id, 0);
 
     drop(bob);
     assert!(
@@ -99,9 +97,104 @@ async fn client_state_tracks_user_join_and_remove() {
 
     let state = alice.state().await;
     assert!(state.users.get(&bob_session).is_none());
-    assert!(state.user_channels.get(&bob_session).is_none());
 
     handle.abort();
+}
+
+#[tokio::test]
+async fn self_mute_propagates_to_other_client() {
+    tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .try_init()
+        .ok();
+
+    let (port, _handle) = start_server().await;
+    sleep(Duration::from_millis(200)).await;
+
+    let cfg_a = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("alice")
+        .accept_invalid_certs(true)
+        .build();
+    let mut alice = MumbleConnection::new(cfg_a);
+    let mut alice_events = alice.subscribe_events();
+    alice.connect().await.expect("alice connect");
+    let alice_session = alice.state().await.session_id.expect("alice session");
+    assert!(
+        wait_for_event(&mut alice_events, Duration::from_secs(5), |ev| {
+            matches!(ev, MumbleEvent::ServerSync(sync) if sync.session == Some(alice_session))
+        })
+        .await,
+        "alice should receive ServerSync"
+    );
+
+    let cfg_b = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("bob")
+        .accept_invalid_certs(true)
+        .build();
+    let mut bob = MumbleConnection::new(cfg_b);
+    let mut bob_events = bob.subscribe_events();
+    bob.connect().await.expect("bob connect");
+    let bob_session = bob.state().await.session_id.expect("bob session");
+    assert!(
+        wait_for_event(&mut bob_events, Duration::from_secs(5), |ev| {
+            matches!(ev, MumbleEvent::ServerSync(sync) if sync.session == Some(bob_session))
+        })
+        .await,
+        "bob should receive ServerSync"
+    );
+    // Wait for alice to see bob join
+    assert!(
+        wait_for_event(&mut alice_events, Duration::from_secs(5), |ev| {
+            matches!(ev, MumbleEvent::UserState(user) if user.session == Some(bob_session))
+        })
+        .await,
+        "alice should observe bob join"
+    );
+
+    // Bob self-mutes
+    use mumblers::proto::mumble::UserState;
+    let self_mute_msg = UserState {
+        session: Some(bob_session),
+        self_mute: Some(true),
+        self_deaf: Some(true),
+        ..Default::default()
+    };
+    bob.send_message(mumblers::messages::MumbleMessage::UserState(self_mute_msg))
+        .await
+        .expect("bob sends self-mute");
+
+    // Alice should receive a UserState update with self_mute=true
+    let got_update = wait_for_event(&mut alice_events, Duration::from_secs(5), |ev| {
+        if let MumbleEvent::UserState(us) = ev {
+            us.session == Some(bob_session)
+                && us.self_mute == Some(true)
+                && us.self_deaf == Some(true)
+        } else {
+            false
+        }
+    })
+    .await;
+    assert!(
+        got_update,
+        "alice should see bob's self-mute/self-deaf state update"
+    );
+
+    // Client state should also reflect the update
+    let state = alice.state().await;
+    let bob_info = state
+        .users
+        .get(&bob_session)
+        .expect("bob should be in alice's state");
+    assert!(
+        bob_info.self_mute,
+        "bob should be self-muted in alice's state"
+    );
+    assert!(
+        bob_info.self_deaf,
+        "bob should be self-deafened in alice's state"
+    );
 }
 
 async fn wait_for_event<F>(

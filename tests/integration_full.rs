@@ -210,8 +210,8 @@ async fn full_stack_text_and_udp() {
     {
         let state = a.state().await;
         assert_eq!(
-            state.user_channels.get(&a_session),
-            Some(&games_channel_id),
+            state.user_channel(a_session),
+            Some(games_channel_id),
             "alice should remain in games"
         );
     }

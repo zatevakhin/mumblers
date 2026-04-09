@@ -1273,7 +1273,7 @@ async fn handle_inbound_message(
                 apply_user_state_update(&mut guard, &message);
                 if let Some(session) = message.session {
                     if message.channel_id.is_some() {
-                        let current = guard.user_channels.get(&session).copied();
+                        let current = guard.users.get(&session).map(|u| u.channel_id);
                         tracing::info!(
                             conn_session,
                             session,
@@ -1487,28 +1487,16 @@ async fn apply_channel_remove_update(state: &Arc<Mutex<ClientState>>, message: &
 
 fn apply_user_state_update(state: &mut ClientState, message: &UserState) {
     if let Some(session) = message.session {
-        match (&message.name, message.channel_id) {
-            (Some(name), Some(channel_id)) => {
-                tracing::debug!(session, channel_id, user=%name, "UserState: name+channel");
-                state.users.insert(session, name.clone());
-                state.user_channels.insert(session, channel_id);
-            }
-            (Some(name), None) => {
-                tracing::debug!(session, user=%name, "UserState: name only");
-                state.users.insert(session, name.clone());
-                // Heuristic: some servers omit channel_id for users in root.
-                // If we don't yet have a mapping for this session, assume root (0).
-                state.user_channels.entry(session).or_insert(0);
-            }
-            (None, Some(channel_id)) => {
-                let existing = state.users.get(&session).cloned();
-                tracing::debug!(session, channel_id, known_user=?existing, "UserState: channel only");
-                state.user_channels.insert(session, channel_id);
-            }
-            (None, None) => {
-                tracing::debug!(session, "UserState: no name/channel");
-            }
-        }
+        let info = state.users.entry(session).or_default();
+        info.apply_update(message);
+        tracing::debug!(
+            session,
+            name = ?info.name,
+            channel_id = info.channel_id,
+            self_mute = info.self_mute,
+            self_deaf = info.self_deaf,
+            "UserState: applied update"
+        );
     } else {
         tracing::debug!("UserState without session; ignoring");
     }
@@ -1517,7 +1505,6 @@ fn apply_user_state_update(state: &mut ClientState, message: &UserState) {
 fn apply_user_remove_update(state: &mut ClientState, message: &UserRemove) {
     let session = message.session;
     state.users.remove(&session);
-    state.user_channels.remove(&session);
 }
 
 fn slice_to_array(bytes: &[u8]) -> [u8; 16] {

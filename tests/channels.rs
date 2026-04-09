@@ -169,9 +169,9 @@ fn test_send_channel_message() {
 #[test]
 fn test_get_users_in_channel() {
     let mut state = ClientState::default();
-    state.user_channels.insert(1, 0);
-    state.user_channels.insert(2, 1);
-    state.user_channels.insert(3, 0);
+    state.users.entry(1).or_default().channel_id = 0;
+    state.users.entry(2).or_default().channel_id = 1;
+    state.users.entry(3).or_default().channel_id = 0;
 
     let users_in_0 = state.get_users_in_channel(0);
     assert_eq!(users_in_0.len(), 2);

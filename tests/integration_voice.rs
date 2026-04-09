@@ -561,9 +561,15 @@ async fn connect_trio() -> (
             .build();
         let mut conn = MumbleConnection::new(cfg);
         let mut events = conn.subscribe_events();
-        conn.connect().await.unwrap_or_else(|e| panic!("{name} connect: {e}"));
+        conn.connect()
+            .await
+            .unwrap_or_else(|e| panic!("{name} connect: {e}"));
         sleep(Duration::from_millis(300)).await;
-        let session = conn.state().await.session_id.expect(&format!("{name} session"));
+        let session = conn
+            .state()
+            .await
+            .session_id
+            .expect(&format!("{name} session"));
         assert!(
             wait_for_event(&mut events, Duration::from_secs(5), |ev| matches!(
                 ev,
@@ -594,7 +600,7 @@ async fn voice_whisper_to_specific_user() {
     let (alice, bob, carol, alice_session, bob_session, _carol_session) = connect_trio().await;
 
     // Alice registers voice target 5 to whisper only to Bob.
-    use mumblers::proto::mumble::{VoiceTarget, voice_target::Target};
+    use mumblers::proto::mumble::{voice_target::Target, VoiceTarget};
     let vt = VoiceTarget {
         id: Some(5),
         targets: vec![Target {
@@ -628,7 +634,10 @@ async fn voice_whisper_to_specific_user() {
     };
 
     for _ in 0..5 {
-        alice.send_audio(packet.clone()).await.expect("alice sends whisper");
+        alice
+            .send_audio(packet.clone())
+            .await
+            .expect("alice sends whisper");
         sleep(Duration::from_millis(30)).await;
     }
 
@@ -713,11 +722,13 @@ async fn voice_whisper_to_channel() {
         .expect("bob udp ready");
 
     // Move bob to Root channel (channel_id=0)
-    bob.move_user_to_channel(bob_session, 0).await.expect("bob move to root");
+    bob.move_user_to_channel(bob_session, 0)
+        .await
+        .expect("bob move to root");
     sleep(Duration::from_millis(200)).await;
 
     // Alice registers voice target 3 to whisper to Root channel (channel_id=0)
-    use mumblers::proto::mumble::{VoiceTarget, voice_target::Target};
+    use mumblers::proto::mumble::{voice_target::Target, VoiceTarget};
     let vt = VoiceTarget {
         id: Some(3),
         targets: vec![Target {
@@ -749,7 +760,10 @@ async fn voice_whisper_to_channel() {
     };
 
     for _ in 0..5 {
-        alice.send_audio(packet.clone()).await.expect("alice sends channel whisper");
+        alice
+            .send_audio(packet.clone())
+            .await
+            .expect("alice sends channel whisper");
         sleep(Duration::from_millis(30)).await;
     }
 

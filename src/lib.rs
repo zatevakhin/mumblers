@@ -47,3 +47,4 @@ pub use crypto::ocb2::{
     CryptStateOcb2, DecryptError as OcbDecryptError, EncryptError as OcbEncryptError,
 };
 pub use error::MumbleError;
+pub use state::ClientUserInfo;

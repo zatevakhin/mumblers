@@ -15,7 +15,7 @@ use crate::proto::mumble::permission_denied::DenyType as PermissionDenyType;
 use crate::proto::mumble::reject::RejectType;
 use crate::proto::mumble::{
     Authenticate, ChannelState, CodecVersion, CryptSetup, PermissionDenied, Ping, Reject,
-    ServerSync, TextMessage, UserRemove, UserState, Version,
+    ServerSync, TextMessage, UserRemove, Version,
 };
 use crate::proto::mumble_udp as udp_proto;
 use prost::Message;
@@ -234,6 +234,8 @@ pub async fn handle_connection(
                     continue;
                 }
 
+                // Handle channel move if requested
+                let mut channel_denied = false;
                 if let Some(dest_channel) = incoming.channel_id {
                     match _state.move_user_to_channel(session, dest_channel).await {
                         Ok(info) => {
@@ -242,42 +244,9 @@ pub async fn handle_connection(
                                 channel = info.channel_id,
                                 "server: user moved channel"
                             );
-                            let update = UserState {
-                                session: Some(info.session),
-                                actor: Some(session),
-                                channel_id: Some(info.channel_id),
-                                name: info.name.clone(),
-                                ..Default::default()
-                            };
-                            let msg = MumbleMessage::UserState(update.clone());
-                            let delivered_self = _state.send_to(session, msg.clone()).await;
-                            if delivered_self {
-                                tracing::info!(
-                                    session,
-                                    channel = info.channel_id,
-                                    "server: self user state delivered"
-                                );
-                            } else {
-                                tracing::warn!(
-                                    session,
-                                    "server: failed to deliver user state to mover"
-                                );
-                            }
-                            let others = _state.list_users().await;
-                            for other in others {
-                                if other.session == session {
-                                    continue;
-                                }
-                                let delivered = _state.send_to(other.session, msg.clone()).await;
-                                tracing::info!(
-                                    session,
-                                    target = other.session,
-                                    delivered,
-                                    "server: broadcast user state"
-                                );
-                            }
                         }
                         Err(err) => {
+                            channel_denied = true;
                             let (deny_type, reason) = match err {
                                 ChannelError::NoEnter(name) => (
                                     PermissionDenyType::Permission,
@@ -317,6 +286,24 @@ pub async fn handle_connection(
                                 )));
                             }
                         }
+                    }
+                }
+
+                // Apply state field updates (self_mute, self_deaf, etc.)
+                // and broadcast to all clients, even if channel move was denied.
+                if !channel_denied {
+                    if let Some(updated) = _state.update_user_state(session, &incoming).await {
+                        let mut update = updated.to_user_state();
+                        update.actor = Some(session);
+                        let msg = MumbleMessage::UserState(update);
+                        _state.send_to(session, msg.clone()).await;
+                        _state.broadcast_except(session, msg).await;
+                        tracing::info!(
+                            session,
+                            self_mute = ?incoming.self_mute,
+                            self_deaf = ?incoming.self_deaf,
+                            "server: user state updated and broadcast"
+                        );
                     }
                 }
             }
@@ -451,9 +438,16 @@ pub async fn handle_connection(
             }
             Ok(MumbleMessage::VoiceTarget(vt)) => {
                 if let Some(target_id) = vt.id {
-                    if target_id >= 1 && target_id <= 30 {
-                        tracing::debug!(session, target_id, n_targets = vt.targets.len(), "server: voice target registered");
-                        _state.set_voice_targets(session, target_id, vt.targets).await;
+                    if (1..=30).contains(&target_id) {
+                        tracing::debug!(
+                            session,
+                            target_id,
+                            n_targets = vt.targets.len(),
+                            "server: voice target registered"
+                        );
+                        _state
+                            .set_voice_targets(session, target_id, vt.targets)
+                            .await;
                     } else {
                         tracing::debug!(session, target_id, "server: voice target id out of range");
                     }
@@ -524,12 +518,10 @@ async fn handle_authenticated(
         write_message(tls, &MumbleMessage::ChannelState(chan)).await?;
     }
 
-    let self_state = UserState {
-        session: Some(session),
-        name: Some(requested_name.clone()),
-        channel_id: Some(default_channel),
-        ..Default::default()
-    };
+    let mut new_user = UserInfo::new(session, default_channel);
+    new_user.name = Some(requested_name.clone());
+
+    let self_state = new_user.to_user_state();
     write_message(tls, &MumbleMessage::UserState(self_state)).await?;
 
     let sync = ServerSync {
@@ -541,33 +533,17 @@ async fn handle_authenticated(
     write_message(tls, &MumbleMessage::ServerSync(sync)).await?;
 
     let existing_users = state.list_users().await;
-    state
-        .add_user(UserInfo {
-            session,
-            name: Some(requested_name.clone()),
-            channel_id: default_channel,
-        })
-        .await;
+    state.add_user(new_user.clone()).await;
 
     for u in existing_users {
         if u.session == session {
             continue;
         }
-        let ustate = UserState {
-            session: Some(u.session),
-            name: u.name.clone(),
-            channel_id: Some(u.channel_id),
-            ..Default::default()
-        };
+        let ustate = u.to_user_state();
         write_message(tls, &MumbleMessage::UserState(ustate)).await?;
     }
 
-    let newcomer = UserState {
-        session: Some(session),
-        name: Some(requested_name.clone()),
-        channel_id: Some(default_channel),
-        ..Default::default()
-    };
+    let newcomer = new_user.to_user_state();
     let _ = state
         .broadcast_except(session, MumbleMessage::UserState(newcomer))
         .await;
@@ -1390,7 +1366,7 @@ async fn handle_udp_audio(
                 }
             } else if target == 0 {
                 route_channel_audio(state, udp_socket, session, &audio).await?;
-            } else if target >= 1 && target <= 30 {
+            } else if (1..=30).contains(&target) {
                 route_voice_target(state, udp_socket, session, target, &audio).await?;
             } else {
                 tracing::debug!(session, target, "server: unsupported voice target");
@@ -1463,7 +1439,11 @@ async fn route_voice_target(
 ) -> Result<(), String> {
     let recipients = state.resolve_voice_target(session, target_id).await;
     if recipients.is_empty() {
-        tracing::debug!(session, target_id, "server: voice target resolved to no recipients");
+        tracing::debug!(
+            session,
+            target_id,
+            "server: voice target resolved to no recipients"
+        );
         return Ok(());
     }
 

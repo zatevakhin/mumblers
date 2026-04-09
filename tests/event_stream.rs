@@ -331,7 +331,7 @@ async fn test_event_stream_channel_user_text() {
     assert!(channels.get(999).is_none()); // Removed channel
 
     // Verify user channels
-    assert_eq!(state.user_channels.get(&1), Some(&1)); // User moved to channel 1
+    assert_eq!(state.user_channel(1), Some(1)); // User moved to channel 1
 }
 
 #[tokio::test]

@@ -88,7 +88,7 @@ fn print_channel_tree(
                     state
                         .users
                         .get(&session)
-                        .cloned()
+                        .and_then(|u| u.name.clone())
                         .unwrap_or_else(|| format!("Unknown User (session: {})", session))
                 })
                 .collect();

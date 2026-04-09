@@ -43,6 +43,94 @@ pub struct UserInfo {
     pub session: SessionId,
     pub name: Option<String>,
     pub channel_id: u32,
+    pub self_mute: bool,
+    pub self_deaf: bool,
+    pub mute: bool,
+    pub deaf: bool,
+    pub suppress: bool,
+    pub priority_speaker: bool,
+    pub recording: bool,
+    pub user_id: Option<u32>,
+    pub comment: Option<String>,
+    pub hash: Option<String>,
+}
+
+impl UserInfo {
+    /// Create a new `UserInfo` with all flags defaulted to false/None.
+    pub fn new(session: SessionId, channel_id: u32) -> Self {
+        Self {
+            session,
+            name: None,
+            channel_id,
+            self_mute: false,
+            self_deaf: false,
+            mute: false,
+            deaf: false,
+            suppress: false,
+            priority_speaker: false,
+            recording: false,
+            user_id: None,
+            comment: None,
+            hash: None,
+        }
+    }
+
+    /// Convert to a protobuf `UserState` with all tracked fields populated.
+    pub fn to_user_state(&self) -> crate::proto::mumble::UserState {
+        crate::proto::mumble::UserState {
+            session: Some(self.session),
+            name: self.name.clone(),
+            channel_id: Some(self.channel_id),
+            self_mute: Some(self.self_mute),
+            self_deaf: Some(self.self_deaf),
+            mute: Some(self.mute),
+            deaf: Some(self.deaf),
+            suppress: Some(self.suppress),
+            priority_speaker: Some(self.priority_speaker),
+            recording: Some(self.recording),
+            user_id: self.user_id,
+            comment: self.comment.clone(),
+            hash: self.hash.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// Apply fields from an incoming `UserState` protobuf.
+    ///
+    /// Only fields that are `Some` in the incoming message are updated;
+    /// unset fields are left unchanged.
+    pub fn apply_update(&mut self, us: &crate::proto::mumble::UserState) {
+        if let Some(v) = us.self_mute {
+            self.self_mute = v;
+        }
+        if let Some(v) = us.self_deaf {
+            self.self_deaf = v;
+        }
+        if let Some(v) = us.mute {
+            self.mute = v;
+        }
+        if let Some(v) = us.deaf {
+            self.deaf = v;
+        }
+        if let Some(v) = us.suppress {
+            self.suppress = v;
+        }
+        if let Some(v) = us.priority_speaker {
+            self.priority_speaker = v;
+        }
+        if let Some(v) = us.recording {
+            self.recording = v;
+        }
+        if us.user_id.is_some() {
+            self.user_id = us.user_id;
+        }
+        if us.comment.is_some() {
+            self.comment = us.comment.clone();
+        }
+        if us.hash.is_some() {
+            self.hash = us.hash.clone();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -471,6 +559,20 @@ impl ServerState {
             .unwrap_or_default()
     }
 
+    /// Apply a `UserState` update to the stored user and return the updated info.
+    ///
+    /// Returns `None` if the session is unknown.
+    pub async fn update_user_state(
+        &self,
+        session: SessionId,
+        us: &crate::proto::mumble::UserState,
+    ) -> Option<UserInfo> {
+        let mut g = self.inner.write().await;
+        let info = g.users.get_mut(&session)?;
+        info.apply_update(us);
+        Some(info.clone())
+    }
+
     /// Store voice target entries for a given session and target ID (1-30).
     pub async fn set_voice_targets(
         &self,
@@ -734,11 +836,8 @@ mod tests {
     async fn clear_voice_targets_on_user_remove() {
         let state = test_state();
         let session = state.alloc_session().await;
-        let user = UserInfo {
-            session,
-            name: Some("alice".into()),
-            channel_id: 0,
-        };
+        let mut user = UserInfo::new(session, 0);
+        user.name = Some("alice".into());
         state.add_user(user).await;
 
         let targets = vec![Target {
@@ -784,13 +883,9 @@ mod tests {
 
         // Put users 10 and 20 into channel 0 (Root)
         for s in [10u32, 20] {
-            state
-                .add_user(UserInfo {
-                    session: s,
-                    name: Some(format!("user{s}")),
-                    channel_id: 0,
-                })
-                .await;
+            let mut u = UserInfo::new(s, 0);
+            u.name = Some(format!("user{s}"));
+            state.add_user(u).await;
         }
 
         // Target channel 0
@@ -815,5 +910,134 @@ mod tests {
         let state = test_state();
         let recipients = state.resolve_voice_target(1, 99).await;
         assert!(recipients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_info_has_full_state_fields() {
+        let user = UserInfo {
+            session: 1,
+            name: Some("alice".into()),
+            channel_id: 0,
+            self_mute: true,
+            self_deaf: false,
+            mute: false,
+            deaf: false,
+            suppress: false,
+            priority_speaker: false,
+            recording: true,
+            user_id: Some(42),
+            comment: Some("hello".into()),
+            hash: Some("abc123".into()),
+        };
+        assert!(user.self_mute);
+        assert!(!user.self_deaf);
+        assert!(user.recording);
+        assert_eq!(user.user_id, Some(42));
+        assert_eq!(user.comment.as_deref(), Some("hello"));
+        assert_eq!(user.hash.as_deref(), Some("abc123"));
+    }
+
+    #[tokio::test]
+    async fn user_info_defaults_to_false_flags() {
+        let user = UserInfo::new(1, 0);
+        assert_eq!(user.session, 1);
+        assert_eq!(user.channel_id, 0);
+        assert_eq!(user.name, None);
+        assert!(!user.self_mute);
+        assert!(!user.self_deaf);
+        assert!(!user.mute);
+        assert!(!user.deaf);
+        assert!(!user.suppress);
+        assert!(!user.priority_speaker);
+        assert!(!user.recording);
+        assert_eq!(user.user_id, None);
+        assert_eq!(user.comment, None);
+        assert_eq!(user.hash, None);
+    }
+
+    #[tokio::test]
+    async fn update_user_state_self_mute() {
+        let state = test_state();
+        let session = state.alloc_session().await;
+        let mut user = UserInfo::new(session, 0);
+        user.name = Some("alice".into());
+        state.add_user(user).await;
+
+        let us = crate::proto::mumble::UserState {
+            session: Some(session),
+            self_mute: Some(true),
+            self_deaf: Some(true),
+            ..Default::default()
+        };
+        let updated = state.update_user_state(session, &us).await;
+        assert!(updated.is_some());
+        let info = updated.unwrap();
+        assert!(info.self_mute);
+        assert!(info.self_deaf);
+
+        // Verify it persists
+        let info2 = state.user_info(session).await.unwrap();
+        assert!(info2.self_mute);
+        assert!(info2.self_deaf);
+    }
+
+    #[tokio::test]
+    async fn update_user_state_does_not_clear_unset_fields() {
+        let state = test_state();
+        let session = state.alloc_session().await;
+        let mut user = UserInfo::new(session, 0);
+        user.name = Some("bob".into());
+        user.self_mute = true;
+        user.comment = Some("old comment".into());
+        state.add_user(user).await;
+
+        // Send an update that only sets recording, leaves self_mute unset
+        let us = crate::proto::mumble::UserState {
+            session: Some(session),
+            recording: Some(true),
+            ..Default::default()
+        };
+        let updated = state.update_user_state(session, &us).await.unwrap();
+        assert!(updated.recording);
+        // self_mute and comment should be preserved
+        assert!(updated.self_mute);
+        assert_eq!(updated.comment.as_deref(), Some("old comment"));
+    }
+
+    #[tokio::test]
+    async fn update_user_state_unknown_session_returns_none() {
+        let state = test_state();
+        let us = crate::proto::mumble::UserState {
+            session: Some(999),
+            self_mute: Some(true),
+            ..Default::default()
+        };
+        assert!(state.update_user_state(999, &us).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn user_info_to_proto_roundtrip() {
+        let mut user = UserInfo::new(5, 2);
+        user.name = Some("carol".into());
+        user.self_mute = true;
+        user.recording = true;
+        user.priority_speaker = true;
+        user.comment = Some("test".into());
+        user.hash = Some("deadbeef".into());
+        user.user_id = Some(100);
+
+        let proto = user.to_user_state();
+        assert_eq!(proto.session, Some(5));
+        assert_eq!(proto.channel_id, Some(2));
+        assert_eq!(proto.name, Some("carol".into()));
+        assert_eq!(proto.self_mute, Some(true));
+        assert_eq!(proto.self_deaf, Some(false));
+        assert_eq!(proto.mute, Some(false));
+        assert_eq!(proto.deaf, Some(false));
+        assert_eq!(proto.recording, Some(true));
+        assert_eq!(proto.priority_speaker, Some(true));
+        assert_eq!(proto.comment, Some("test".into()));
+        assert_eq!(proto.hash, Some("deadbeef".into()));
+        assert_eq!(proto.user_id, Some(100));
     }
 }
