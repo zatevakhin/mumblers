@@ -12,7 +12,7 @@ use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
-use tokio::time::{interval, sleep, timeout, Instant as TokioInstant};
+use tokio::time::{interval, timeout};
 use tokio_rustls::rustls::{
     self,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -301,6 +301,7 @@ pub struct MumbleConnection {
     shutdown_tx: Option<watch::Sender<bool>>,
     connection_task: Option<JoinHandle<()>>,
     event_tx: broadcast::Sender<MumbleEvent>,
+    udp_ready: Arc<tokio::sync::Notify>,
     #[cfg(feature = "audio")]
     audio_playback: Option<Arc<AudioPlaybackManager>>,
     #[cfg(feature = "audio")]
@@ -323,6 +324,7 @@ impl MumbleConnection {
             shutdown_tx: None,
             connection_task: None,
             event_tx,
+            udp_ready: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "audio")]
             audio_playback: playback,
             #[cfg(feature = "audio")]
@@ -428,6 +430,7 @@ impl MumbleConnection {
                             };
                             state.udp = Some(params);
                             drop(state);
+                            self.udp_ready.notify_waiters();
                             Some(())
                         }
                         _ => {
@@ -671,22 +674,24 @@ impl MumbleConnection {
             return Ok(());
         }
 
-        let check_interval = Duration::from_millis(20);
-        let deadline = timeout.map(|limit| TokioInstant::now() + limit);
-        loop {
-            {
+        let notify = self.udp_ready.clone();
+        let wait = async {
+            loop {
+                notify.notified().await;
                 if self.shared_state.lock().await.udp.is_some() {
-                    return Ok(());
+                    return;
                 }
             }
-            if let Some(deadline) = deadline {
-                if TokioInstant::now() >= deadline {
-                    return Err(MumbleError::Timeout(
-                        "timed out waiting for UDP CryptSetup".into(),
-                    ));
-                }
+        };
+
+        match timeout {
+            Some(limit) => tokio::time::timeout(limit, wait)
+                .await
+                .map_err(|_| MumbleError::Timeout("timed out waiting for UDP CryptSetup".into())),
+            None => {
+                wait.await;
+                Ok(())
             }
-            sleep(check_interval).await;
         }
     }
 
@@ -892,6 +897,7 @@ impl MumbleConnection {
 
         let shared_state = Arc::clone(&self.shared_state);
         let event_tx = self.event_tx.clone();
+        let udp_ready = Arc::clone(&self.udp_ready);
         let udp_options = UdpOptions {
             target: self.udp_target,
             enable: self.config.enable_udp,
@@ -956,6 +962,7 @@ impl MumbleConnection {
                 resync_rx,
                 resync_tx,
                 UDP_RESYNC_INTERVAL,
+                udp_ready,
                 #[cfg(feature = "audio")]
                 playback,
             )
@@ -1022,6 +1029,7 @@ async fn connection_loop(
     mut resync_rx: mpsc::Receiver<()>,
     resync_tx: mpsc::Sender<()>,
     udp_resync_interval: Duration,
+    udp_ready: Arc<tokio::sync::Notify>,
     #[cfg(feature = "audio")] playback: Option<Arc<AudioPlaybackManager>>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -1156,6 +1164,7 @@ async fn connection_loop(
                             &state,
                             &event_tx,
                             &mut tcp_tunnel_crypt,
+                            &udp_ready,
                         )
                         .await
                         {
@@ -1228,6 +1237,7 @@ async fn handle_inbound_message(
     state: &Arc<Mutex<ClientState>>,
     event_tx: &broadcast::Sender<MumbleEvent>,
     tcp_tunnel_crypt: &mut Option<CryptStateOcb2>,
+    udp_ready: &tokio::sync::Notify,
 ) -> Option<CryptUpdate> {
     match MumbleMessage::try_from(envelope.clone()) {
         Ok(MumbleMessage::CryptSetup(setup)) => {
@@ -1235,6 +1245,9 @@ async fn handle_inbound_message(
                 let mut guard = state.lock().await;
                 update_udp_state_with_cryptsetup(&mut guard, &setup)
             };
+            if action.is_some() {
+                udp_ready.notify_waiters();
+            }
             let _ = event_tx.send(MumbleEvent::CryptSetup(setup));
             action
         }
@@ -1838,7 +1851,10 @@ mod tests {
             MessageEnvelope::try_from_message(TcpMessageKind::CryptSetup, &crypt).unwrap();
 
         let mut tunnel_crypt: Option<CryptStateOcb2> = None;
-        let update = handle_inbound_message(envelope, &state, &event_tx, &mut tunnel_crypt).await;
+        let udp_notify = tokio::sync::Notify::new();
+        let update =
+            handle_inbound_message(envelope, &state, &event_tx, &mut tunnel_crypt, &udp_notify)
+                .await;
         match update {
             Some(CryptUpdate::Full(params)) => {
                 assert_eq!(params.key, [1; 16]);
