@@ -95,11 +95,12 @@ pub async fn handle_connection(
     let (mut reader, writer_tx, writer_task) =
         spawn_writer_task(tls, _state.clone(), session).await;
     let mut send_failure: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    let idle_timeout = Duration::from_secs(60);
 
     loop {
-        let env = match read_envelope(&mut reader).await {
-            Ok(env) => env,
-            Err(err) => {
+        let env = match tokio::time::timeout(idle_timeout, read_envelope(&mut reader)).await {
+            Ok(Ok(env)) => env,
+            Ok(Err(err)) => {
                 tracing::warn!(
                     session,
                     error = ?err,
@@ -115,6 +116,21 @@ pub async fn handle_connection(
                 _state.remove_user(session).await;
                 drop(writer_task);
                 return Err(Box::new(err));
+            }
+            Err(_) => {
+                tracing::warn!(session, "server: client idle timeout, disconnecting");
+                let remove = UserRemove {
+                    session,
+                    reason: Some("Idle timeout".to_string()),
+                    ..Default::default()
+                };
+                let _ = _state
+                    .broadcast_except(session, MumbleMessage::UserRemove(remove.clone()))
+                    .await;
+                let _ = writer_tx.send(MumbleMessage::UserRemove(remove)).await;
+                _state.remove_user(session).await;
+                drop(writer_task);
+                return Ok(());
             }
         };
 
