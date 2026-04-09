@@ -87,6 +87,10 @@ pub enum MumbleEvent {
     TextMessage(TextMessage),
     PermissionDenied(PermissionDenied),
     ServerConfig(crate::proto::mumble::ServerConfig),
+    /// Connection was lost or timed out.
+    Disconnected {
+        reason: String,
+    },
     Other(MumbleMessage),
     Unknown(MessageEnvelope),
 }
@@ -1004,6 +1008,8 @@ fn apply_latency_metrics(state: &mut ClientState, ping: &crate::proto::mumble::P
     }
 }
 
+const PING_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[allow(clippy::too_many_arguments)]
 async fn connection_loop(
     stream: TlsStream<TcpStream>,
@@ -1081,6 +1087,23 @@ async fn connection_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                // Check for ping timeout
+                {
+                    let guard = state.lock().await;
+                    if let Some(last_ms) = guard.last_ping_received_ms {
+                        let elapsed = (current_millis() as u128).saturating_sub(last_ms);
+                        if elapsed > PING_TIMEOUT.as_millis() {
+                            tracing::warn!(
+                                elapsed_ms = elapsed,
+                                "client: ping timeout, disconnecting"
+                            );
+                            let _ = event_tx.send(MumbleEvent::Disconnected {
+                                reason: "ping timeout".to_string(),
+                            });
+                            break;
+                        }
+                    }
+                }
                 if send_ping_internal(&mut writer, &state).await.is_err() {
                     break;
                 }
