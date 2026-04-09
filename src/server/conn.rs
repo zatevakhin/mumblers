@@ -499,6 +499,13 @@ async fn handle_authenticated(
         return Err(Box::new(HandshakeRejected));
     }
 
+    if let Some(max) = state.cfg.max_users {
+        if state.user_count().await >= max as usize {
+            send_reject(tls, RejectType::ServerFull, "Server is full").await?;
+            return Err(Box::new(HandshakeRejected));
+        }
+    }
+
     let session = state.alloc_session().await;
     if requested_name.is_empty() {
         requested_name = format!("Guest{}", session);

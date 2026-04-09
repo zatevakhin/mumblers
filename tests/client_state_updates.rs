@@ -197,6 +197,74 @@ async fn self_mute_propagates_to_other_client() {
     );
 }
 
+fn make_tls() -> Arc<rustls::ServerConfig> {
+    let cert = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.serialize_private_key_der().into());
+    let cert_der = rustls::pki_types::CertificateDer::from(cert.serialize_der().unwrap());
+    Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key)
+            .unwrap(),
+    )
+}
+
+async fn start_server_with_config(mut cfg: ServerConfig) -> (u16, tokio::task::JoinHandle<()>) {
+    let port = 20000 + (rand::random::<u16>() % 30000);
+    cfg.bind_port = port;
+    cfg.udp_bind_port = port;
+    let tls = make_tls();
+    let server = MumbleServer::new(cfg, tls);
+    let handle = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    (port, handle)
+}
+
+#[tokio::test]
+async fn server_rejects_when_max_users_reached() {
+    tracing_subscriber::fmt()
+        .with_env_filter("info")
+        .try_init()
+        .ok();
+
+    let mut cfg = ServerConfig::default();
+    cfg.max_users = Some(1);
+    let (port, _handle) = start_server_with_config(cfg).await;
+    sleep(Duration::from_millis(200)).await;
+
+    // First connection should succeed
+    let cfg_a = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("alice")
+        .accept_invalid_certs(true)
+        .build();
+    let mut alice = MumbleConnection::new(cfg_a);
+    let mut alice_events = alice.subscribe_events();
+    alice.connect().await.expect("alice should connect");
+    let alice_session = alice.state().await.session_id.expect("alice session");
+    assert!(
+        wait_for_event(&mut alice_events, Duration::from_secs(5), |ev| {
+            matches!(ev, MumbleEvent::ServerSync(sync) if sync.session == Some(alice_session))
+        })
+        .await,
+        "alice should receive ServerSync"
+    );
+
+    // Second connection should be rejected with ServerFull
+    let cfg_b = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("bob")
+        .accept_invalid_certs(true)
+        .build();
+    let mut bob = MumbleConnection::new(cfg_b);
+    let result = bob.connect().await;
+    assert!(
+        result.is_err(),
+        "bob should fail to connect when server is full"
+    );
+}
+
 async fn wait_for_event<F>(
     rx: &mut tokio::sync::broadcast::Receiver<MumbleEvent>,
     timeout_dur: Duration,

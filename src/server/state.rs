@@ -310,6 +310,11 @@ impl ServerState {
         g.voice_targets.remove(&session);
     }
 
+    pub async fn user_count(&self) -> usize {
+        let g = self.inner.read().await;
+        g.users.len()
+    }
+
     pub async fn list_users(&self) -> Vec<UserInfo> {
         let g = self.inner.read().await;
         g.users.values().cloned().collect()
@@ -1039,5 +1044,44 @@ mod tests {
         assert_eq!(proto.comment, Some("test".into()));
         assert_eq!(proto.hash, Some("deadbeef".into()));
         assert_eq!(proto.user_id, Some(100));
+    }
+
+    #[test]
+    fn server_config_max_users_defaults_to_none() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.max_users, None);
+    }
+
+    #[test]
+    fn server_config_max_users_from_toml() {
+        let toml = r#"
+            bind_host = "127.0.0.1"
+            bind_port = 64738
+            udp_bind_port = 64738
+            max_users = 10
+        "#;
+        let cfg = ServerConfig::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.max_users, Some(10));
+    }
+
+    #[tokio::test]
+    async fn user_count_tracks_connected_users() {
+        let state = test_state();
+        assert_eq!(state.user_count().await, 0);
+
+        let s1 = state.alloc_session().await;
+        let mut u1 = UserInfo::new(s1, 0);
+        u1.name = Some("alice".into());
+        state.add_user(u1).await;
+        assert_eq!(state.user_count().await, 1);
+
+        let s2 = state.alloc_session().await;
+        let mut u2 = UserInfo::new(s2, 0);
+        u2.name = Some("bob".into());
+        state.add_user(u2).await;
+        assert_eq!(state.user_count().await, 2);
+
+        state.remove_user(s1).await;
+        assert_eq!(state.user_count().await, 1);
     }
 }

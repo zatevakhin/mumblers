@@ -40,6 +40,8 @@ pub struct ServerConfig {
     pub codec_prefer_alpha: bool,
     #[serde(default = "default_enable_opus")]
     pub enable_opus: bool,
+    #[serde(default)]
+    pub max_users: Option<u32>,
 }
 
 impl Default for ServerConfig {
@@ -60,6 +62,7 @@ impl Default for ServerConfig {
             codec_beta: default_codec_beta(),
             codec_prefer_alpha: default_codec_prefer_alpha(),
             enable_opus: default_enable_opus(),
+            max_users: None,
         }
     }
 }
