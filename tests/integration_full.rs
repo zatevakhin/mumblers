@@ -1,25 +1,14 @@
 use mumblers::proto::mumble::permission_denied::DenyType as PermissionDenyType;
+mod common;
+
+use common::{make_tls, wait_for_event};
 use mumblers::{
     server::{ChannelConfig, MumbleServer, ServerConfig},
     ConnectionConfig, MumbleConnection, MumbleEvent,
 };
-use rcgen::generate_simple_self_signed;
-use std::sync::Arc;
-use tokio::time::{sleep, timeout, Duration, Instant};
-use tokio_rustls::rustls;
+use tokio::time::{sleep, Duration};
 
 async fn start_server() -> (u16, tokio::task::JoinHandle<()>) {
-    fn make_tls(_cfg: &ServerConfig) -> Arc<rustls::ServerConfig> {
-        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.serialize_private_key_der().into());
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.serialize_der().unwrap());
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key)
-            .unwrap();
-        Arc::new(config)
-    }
-
     let mut cfg = ServerConfig::default();
     cfg.default_channel = "Lobby".to_string();
     cfg.channels = vec![
@@ -54,7 +43,7 @@ async fn start_server() -> (u16, tokio::task::JoinHandle<()>) {
     let port = 20000 + (rand::random::<u16>() % 30000);
     cfg.bind_port = port;
     cfg.udp_bind_port = 40000 + (rand::random::<u16>() % 20000);
-    let tls = make_tls(&cfg);
+    let tls = make_tls();
     let server = MumbleServer::new(cfg, tls);
     let handle = tokio::spawn(async move {
         let _ = server.serve().await;
@@ -103,14 +92,16 @@ async fn full_stack_text_and_udp() {
         wait_for_event(&mut a_events, Duration::from_secs(5), |ev| {
             matches!(ev, MumbleEvent::ServerSync(sync) if sync.session == Some(a_session))
         })
-        .await,
+        .await
+        .is_some(),
         "alice should receive ServerSync"
     );
     assert!(
         wait_for_event(&mut b_events, Duration::from_secs(5), |ev| {
             matches!(ev, MumbleEvent::ServerSync(sync) if sync.session == Some(b_session))
         })
-        .await,
+        .await
+        .is_some(),
         "bob should receive ServerSync"
     );
 
@@ -162,7 +153,8 @@ async fn full_stack_text_and_udp() {
                         && user.channel_id == Some(games_channel_id)
             )
         )
-        .await,
+        .await
+        .is_some(),
         "bob should observe alice moving to games"
     );
 
@@ -191,7 +183,8 @@ async fn full_stack_text_and_udp() {
                         && user.channel_id == Some(games_channel_id)
             )
         )
-        .await,
+        .await
+        .is_some(),
         "alice should observe bob moving to games"
     );
 
@@ -204,7 +197,8 @@ async fn full_stack_text_and_udp() {
         wait_for_event(&mut a_events, Duration::from_secs(5), |ev| {
             matches!(ev, MumbleEvent::PermissionDenied(pd) if pd.r#type == Some(PermissionDenyType::Permission as i32) && pd.channel_id == Some(afk_channel_id))
         })
-        .await,
+        .await
+        .is_some(),
         "alice should receive PermissionDenied for AFK"
     );
     {
@@ -230,6 +224,7 @@ async fn full_stack_text_and_udp() {
             |ev| matches!(ev, MumbleEvent::TextMessage(msg) if msg.message == "hello from alice"),
         )
         .await
+        .is_some()
         {
             channel_ok = true;
             break;
@@ -254,6 +249,7 @@ async fn full_stack_text_and_udp() {
             |ev| matches!(ev, MumbleEvent::TextMessage(msg) if msg.message == "whisper from alice"),
         )
         .await
+        .is_some()
         {
             whisper_ok = true;
             break;
@@ -271,10 +267,11 @@ async fn full_stack_text_and_udp() {
     // UDP keepalive check (best effort)
     let mut udp_rx = a.subscribe_events();
     while let Ok(_) = udp_rx.try_recv() {}
-    if !wait_for_event(&mut udp_rx, Duration::from_secs(5), |ev| {
+    if wait_for_event(&mut udp_rx, Duration::from_secs(5), |ev| {
         matches!(ev, MumbleEvent::UdpPing(_))
     })
     .await
+    .is_none()
     {
         let state = a.state().await;
         assert!(state.udp.is_some(), "alice UDP state should be initialized");
@@ -300,38 +297,10 @@ async fn join_channel_and_wait(
                 if user.session == Some(session) && user.channel_id == Some(channel_id)
         )
     })
-    .await;
+    .await
+    .is_some();
     if !observed {
         tracing::warn!(session, channel_id, "join_channel_and_wait timed out");
     }
     observed
-}
-
-async fn wait_for_event<F>(
-    rx: &mut tokio::sync::broadcast::Receiver<MumbleEvent>,
-    timeout_dur: Duration,
-    mut pred: F,
-) -> bool
-where
-    F: FnMut(&MumbleEvent) -> bool,
-{
-    let deadline = Instant::now() + timeout_dur;
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        let remaining = deadline - now;
-        match timeout(remaining, rx.recv()).await {
-            Ok(Ok(ev)) => {
-                tracing::info!(?ev, "integration_full: event observed");
-                if pred(&ev) {
-                    return true;
-                }
-            }
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(_)) => return false,
-            Err(_) => return false,
-        }
-    }
 }

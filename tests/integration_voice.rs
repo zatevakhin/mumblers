@@ -1,41 +1,17 @@
 use mumblers::audio::{AudioHeader, VoicePacket};
+mod common;
+
+use common::{init_tracing, start_server_with_config, wait_for_event};
 use mumblers::messages::MumbleMessage;
 use mumblers::proto::mumble::ServerSync;
 use mumblers::proto::mumble_udp;
-use mumblers::server::{ChannelConfig, MumbleServer, ServerConfig};
+use mumblers::server::{ChannelConfig, ServerConfig};
 use mumblers::{ConnectionConfig, MumbleConnection, MumbleEvent};
 use prost::Message;
-use rcgen::generate_simple_self_signed;
 use std::collections::HashSet;
-use std::sync::Arc;
-use tokio::time::{sleep, timeout, Duration};
-use tokio_rustls::rustls;
-
-fn init_tracing() {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .try_init()
-            .ok();
-    });
-}
+use tokio::time::{sleep, Duration};
 
 async fn start_server() -> (u16, tokio::task::JoinHandle<()>) {
-    fn make_tls(_cfg: &ServerConfig) -> Arc<rustls::ServerConfig> {
-        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.serialize_private_key_der().into());
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.serialize_der().unwrap());
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key)
-            .unwrap();
-        Arc::new(config)
-    }
-
     let mut cfg = ServerConfig::default();
     cfg.default_channel = "Lobby".to_string();
     cfg.channels = vec![ChannelConfig {
@@ -47,43 +23,7 @@ async fn start_server() -> (u16, tokio::task::JoinHandle<()>) {
         noenter: None,
         silent: None,
     }];
-    let port = 20000 + (rand::random::<u16>() % 30000);
-    cfg.bind_port = port;
-    cfg.udp_bind_port = port;
-    let tls = make_tls(&cfg);
-    let server = MumbleServer::new(cfg, tls);
-    let handle = tokio::spawn(async move {
-        let _ = server.serve().await;
-    });
-    (port, handle)
-}
-
-async fn wait_for_event<F>(
-    rx: &mut tokio::sync::broadcast::Receiver<MumbleEvent>,
-    limit: Duration,
-    mut predicate: F,
-) -> Option<MumbleEvent>
-where
-    F: FnMut(&MumbleEvent) -> bool,
-{
-    let deadline = timeout(limit, async {
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    if predicate(&ev) {
-                        return Some(ev);
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => return None,
-            }
-        }
-    })
-    .await;
-    match deadline {
-        Ok(found) => found,
-        Err(_) => None,
-    }
+    start_server_with_config(cfg).await
 }
 
 async fn connect_pair() -> (MumbleConnection, MumbleConnection, u32, u32) {

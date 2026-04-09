@@ -1,34 +1,8 @@
-use mumblers::{
-    server::{MumbleServer, ServerConfig},
-    ConnectionConfig, MumbleConnection,
-};
-use rcgen::generate_simple_self_signed;
-use std::sync::Arc;
+mod common;
+
+use common::start_server;
+use mumblers::{ConnectionConfig, MumbleConnection};
 use tokio::time::{sleep, Duration};
-use tokio_rustls::rustls;
-
-async fn start_server() -> (u16, tokio::task::JoinHandle<()>) {
-    fn make_tls(_cfg: &ServerConfig) -> Arc<rustls::ServerConfig> {
-        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.serialize_private_key_der().into());
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.serialize_der().unwrap());
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key)
-            .unwrap();
-        Arc::new(config)
-    }
-
-    let mut cfg = ServerConfig::default();
-    let port = 20000 + (rand::random::<u16>() % 30000);
-    cfg.bind_port = port;
-    let tls = make_tls(&cfg);
-    let server = MumbleServer::new(cfg, tls);
-    let handle = tokio::spawn(async move {
-        let _ = server.serve().await;
-    });
-    (port, handle)
-}
 
 #[tokio::test]
 async fn channel_text_broadcast() {

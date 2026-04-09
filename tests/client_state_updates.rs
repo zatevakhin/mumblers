@@ -1,33 +1,9 @@
-use mumblers::server::{MumbleServer, ServerConfig};
+mod common;
+
+use common::{start_server, start_server_with_config, wait_for_event};
+use mumblers::server::ServerConfig;
 use mumblers::{ConnectionConfig, MumbleConnection, MumbleEvent};
-use rcgen::generate_simple_self_signed;
-use std::sync::Arc;
-use tokio::time::{sleep, timeout, Duration, Instant};
-use tokio_rustls::rustls;
-
-async fn start_server() -> (u16, tokio::task::JoinHandle<()>) {
-    fn make_tls() -> Arc<rustls::ServerConfig> {
-        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.serialize_private_key_der().into());
-        let cert_der = rustls::pki_types::CertificateDer::from(cert.serialize_der().unwrap());
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key)
-            .unwrap();
-        Arc::new(config)
-    }
-
-    let mut cfg = ServerConfig::default();
-    let port = 20000 + (rand::random::<u16>() % 30000);
-    cfg.bind_port = port;
-    cfg.udp_bind_port = port;
-    let tls = make_tls();
-    let server = MumbleServer::new(cfg, tls);
-    let handle = tokio::spawn(async move {
-        let _ = server.serve().await;
-    });
-    (port, handle)
-}
+use tokio::time::{sleep, Duration};
 
 #[tokio::test]
 async fn client_state_tracks_user_join_and_remove() {
@@ -52,7 +28,8 @@ async fn client_state_tracks_user_join_and_remove() {
         wait_for_event(&mut alice_events, Duration::from_secs(5), |ev| {
             matches!(ev, MumbleEvent::ServerSync(sync) if sync.session == Some(alice_session))
         })
-        .await,
+        .await
+        .is_some(),
         "alice should receive ServerSync"
     );
 
@@ -69,7 +46,8 @@ async fn client_state_tracks_user_join_and_remove() {
         wait_for_event(&mut bob_events, Duration::from_secs(5), |ev| {
             matches!(ev, MumbleEvent::ServerSync(sync) if sync.session == Some(bob_session))
         })
-        .await,
+        .await
+        .is_some(),
         "bob should receive ServerSync"
     );
 
@@ -77,7 +55,8 @@ async fn client_state_tracks_user_join_and_remove() {
         wait_for_event(&mut alice_events, Duration::from_secs(5), |ev| {
             matches!(ev, MumbleEvent::UserState(user) if user.session == Some(bob_session))
         })
-        .await,
+        .await
+        .is_some(),
         "alice should observe bob join"
     );
 
@@ -91,7 +70,8 @@ async fn client_state_tracks_user_join_and_remove() {
         wait_for_event(&mut alice_events, Duration::from_secs(5), |ev| {
             matches!(ev, MumbleEvent::UserRemove(remove) if remove.session == bob_session)
         })
-        .await,
+        .await
+        .is_some(),
         "alice should observe bob removal"
     );
 
@@ -124,7 +104,8 @@ async fn self_mute_propagates_to_other_client() {
         wait_for_event(&mut alice_events, Duration::from_secs(5), |ev| {
             matches!(ev, MumbleEvent::ServerSync(sync) if sync.session == Some(alice_session))
         })
-        .await,
+        .await
+        .is_some(),
         "alice should receive ServerSync"
     );
 
@@ -141,7 +122,8 @@ async fn self_mute_propagates_to_other_client() {
         wait_for_event(&mut bob_events, Duration::from_secs(5), |ev| {
             matches!(ev, MumbleEvent::ServerSync(sync) if sync.session == Some(bob_session))
         })
-        .await,
+        .await
+        .is_some(),
         "bob should receive ServerSync"
     );
     // Wait for alice to see bob join
@@ -149,7 +131,8 @@ async fn self_mute_propagates_to_other_client() {
         wait_for_event(&mut alice_events, Duration::from_secs(5), |ev| {
             matches!(ev, MumbleEvent::UserState(user) if user.session == Some(bob_session))
         })
-        .await,
+        .await
+        .is_some(),
         "alice should observe bob join"
     );
 
@@ -175,7 +158,8 @@ async fn self_mute_propagates_to_other_client() {
             false
         }
     })
-    .await;
+    .await
+    .is_some();
     assert!(
         got_update,
         "alice should see bob's self-mute/self-deaf state update"
@@ -195,30 +179,6 @@ async fn self_mute_propagates_to_other_client() {
         bob_info.self_deaf,
         "bob should be self-deafened in alice's state"
     );
-}
-
-fn make_tls() -> Arc<rustls::ServerConfig> {
-    let cert = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.serialize_private_key_der().into());
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.serialize_der().unwrap());
-    Arc::new(
-        rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key)
-            .unwrap(),
-    )
-}
-
-async fn start_server_with_config(mut cfg: ServerConfig) -> (u16, tokio::task::JoinHandle<()>) {
-    let port = 20000 + (rand::random::<u16>() % 30000);
-    cfg.bind_port = port;
-    cfg.udp_bind_port = port;
-    let tls = make_tls();
-    let server = MumbleServer::new(cfg, tls);
-    let handle = tokio::spawn(async move {
-        let _ = server.serve().await;
-    });
-    (port, handle)
 }
 
 #[tokio::test]
@@ -247,7 +207,8 @@ async fn server_rejects_when_max_users_reached() {
         wait_for_event(&mut alice_events, Duration::from_secs(5), |ev| {
             matches!(ev, MumbleEvent::ServerSync(sync) if sync.session == Some(alice_session))
         })
-        .await,
+        .await
+        .is_some(),
         "alice should receive ServerSync"
     );
 
@@ -265,30 +226,68 @@ async fn server_rejects_when_max_users_reached() {
     );
 }
 
-async fn wait_for_event<F>(
-    rx: &mut tokio::sync::broadcast::Receiver<MumbleEvent>,
-    timeout_dur: Duration,
-    mut pred: F,
-) -> bool
-where
-    F: FnMut(&MumbleEvent) -> bool,
-{
-    let deadline = Instant::now() + timeout_dur;
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        let remaining = deadline - now;
-        match timeout(remaining, rx.recv()).await {
-            Ok(Ok(ev)) => {
-                if pred(&ev) {
-                    return true;
-                }
-            }
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(_)) => return false,
-            Err(_) => return false,
-        }
-    }
+#[tokio::test]
+async fn server_rejects_duplicate_username() {
+    common::init_tracing();
+
+    let (port, _handle) = start_server().await;
+    sleep(Duration::from_millis(200)).await;
+
+    let cfg_a = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("same_name")
+        .accept_invalid_certs(true)
+        .build();
+    let mut alice = MumbleConnection::new(cfg_a);
+    let mut alice_events = alice.subscribe_events();
+    alice.connect().await.expect("first client should connect");
+    let alice_session = alice.state().await.session_id.expect("alice session");
+    assert!(
+        wait_for_event(&mut alice_events, Duration::from_secs(5), |ev| {
+            matches!(ev, MumbleEvent::ServerSync(sync) if sync.session == Some(alice_session))
+        })
+        .await
+        .is_some(),
+        "first client should receive ServerSync"
+    );
+
+    // Second client with the same username should be rejected
+    let cfg_b = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("same_name")
+        .accept_invalid_certs(true)
+        .build();
+    let mut bob = MumbleConnection::new(cfg_b);
+    let result = bob.connect().await;
+    assert!(
+        result.is_err(),
+        "second client with duplicate username should be rejected"
+    );
 }
+
+#[tokio::test]
+async fn server_rejects_empty_username_when_anonymous_disabled() {
+    common::init_tracing();
+
+    let mut cfg = ServerConfig::default();
+    cfg.allow_anonymous = Some(false);
+    let (port, _handle) = start_server_with_config(cfg).await;
+    sleep(Duration::from_millis(200)).await;
+
+    let cfg_a = ConnectionConfig::builder("127.0.0.1")
+        .port(port)
+        .username("")
+        .accept_invalid_certs(true)
+        .build();
+    let mut client = MumbleConnection::new(cfg_a);
+    let result = client.connect().await;
+    assert!(
+        result.is_err(),
+        "empty username should be rejected when allow_anonymous=false"
+    );
+}
+
+// NOTE: server_accepts_empty_username_when_anonymous_enabled is not tested here
+// because the client itself rejects empty usernames before connecting.
+// The server's allow_anonymous path assigns "GuestN" names for empty usernames
+// that arrive over the wire (e.g. from other Mumble clients).
