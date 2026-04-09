@@ -1,11 +1,11 @@
 [package]
 name = "mumblers"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "MIT"
 
 [features]
-default = ["config"]
+default = ["server-bin"]
 audio = ["opus"]
 config = ["serde", "toml"]
 server-bin = ["rcgen", "config"]
