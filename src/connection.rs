@@ -86,6 +86,7 @@ pub enum MumbleEvent {
     UserRemove(UserRemove),
     TextMessage(TextMessage),
     PermissionDenied(PermissionDenied),
+    ServerConfig(crate::proto::mumble::ServerConfig),
     Other(MumbleMessage),
     Unknown(MessageEnvelope),
 }
@@ -480,6 +481,10 @@ impl MumbleConnection {
                 }
                 MumbleMessage::PermissionDenied(message) => {
                     let _ = self.event_tx.send(MumbleEvent::PermissionDenied(message));
+                }
+                MumbleMessage::ServerConfig(sc) => {
+                    let mut state = self.shared_state.lock().await;
+                    state.server_config = Some(sc);
                 }
                 MumbleMessage::Authenticate(_)
                 | MumbleMessage::Ping(_)
@@ -1335,6 +1340,14 @@ async fn handle_inbound_message(
             {
                 tracing::warn!("failed to handle tunneled udp payload: {err}");
             }
+            None
+        }
+        Ok(MumbleMessage::ServerConfig(sc)) => {
+            {
+                let mut guard = state.lock().await;
+                guard.server_config = Some(sc.clone());
+            }
+            let _ = event_tx.send(MumbleEvent::ServerConfig(sc));
             None
         }
         Ok(other) => {

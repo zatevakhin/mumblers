@@ -539,6 +539,17 @@ async fn handle_authenticated(
     };
     write_message(tls, &MumbleMessage::ServerSync(sync)).await?;
 
+    let server_config = crate::proto::mumble::ServerConfig {
+        max_bandwidth: state.cfg.max_bandwidth,
+        welcome_text: state.cfg.welcome_text.clone(),
+        allow_html: Some(true),
+        message_length: Some(5000),
+        image_message_length: Some(131072),
+        max_users: state.cfg.max_users,
+        recording_allowed: Some(true),
+    };
+    write_message(tls, &MumbleMessage::ServerConfig(server_config)).await?;
+
     let existing_users = state.list_users().await;
     state.add_user(new_user.clone()).await;
 
@@ -668,6 +679,7 @@ fn message_name(msg: &MumbleMessage) -> &'static str {
         MumbleMessage::PermissionDenied(_) => "PermissionDenied",
         MumbleMessage::CodecVersion(_) => "CodecVersion",
         MumbleMessage::VoiceTarget(_) => "VoiceTarget",
+        MumbleMessage::ServerConfig(_) => "ServerConfig",
         MumbleMessage::Unknown(_) => "Unknown",
     }
 }

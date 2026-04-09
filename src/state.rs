@@ -87,6 +87,8 @@ pub struct ClientState {
     pub welcome_text: Option<String>,
     /// Server-provided codec negotiation preferences.
     pub codec_version: Option<CodecVersion>,
+    /// Server configuration limits received via ServerConfig message.
+    pub server_config: Option<crate::proto::mumble::ServerConfig>,
     /// Cryptographic parameters provided via CryptSetup for the UDP tunnel.
     pub udp: Option<UdpState>,
     /// Channel hierarchy and management.
@@ -137,6 +139,7 @@ impl Default for ClientState {
             permissions: None,
             welcome_text: None,
             codec_version: None,
+            server_config: None,
             udp: None,
             channels: crate::channels::new_shared_channels(),
         }

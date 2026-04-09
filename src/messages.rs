@@ -6,7 +6,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::proto::mumble::{
     Authenticate, ChannelRemove, ChannelState, CodecVersion, CryptSetup, PermissionDenied, Ping,
-    Reject, ServerSync, TextMessage, UdpTunnel, UserRemove, UserState, Version, VoiceTarget,
+    Reject, ServerConfig, ServerSync, TextMessage, UdpTunnel, UserRemove, UserState, Version,
+    VoiceTarget,
 };
 
 /// Protocol revision tuple (major, minor, patch) advertised to the server.
@@ -144,6 +145,8 @@ pub enum TcpMessageKind {
     CodecVersion,
     /// Voice target registration for whisper/shout.
     VoiceTarget,
+    /// Server configuration limits sent after ServerSync.
+    ServerConfig,
     /// Any message that does not yet have an explicit mapping.
     Unknown(u16),
 }
@@ -167,6 +170,7 @@ impl TcpMessageKind {
             21 => TcpMessageKind::CodecVersion,
             15 => TcpMessageKind::CryptSetup,
             19 => TcpMessageKind::VoiceTarget,
+            24 => TcpMessageKind::ServerConfig,
             other => TcpMessageKind::Unknown(other),
         }
     }
@@ -189,6 +193,7 @@ impl TcpMessageKind {
             TcpMessageKind::CodecVersion => 21,
             TcpMessageKind::CryptSetup => 15,
             TcpMessageKind::VoiceTarget => 19,
+            TcpMessageKind::ServerConfig => 24,
             TcpMessageKind::Unknown(value) => value,
         }
     }
@@ -303,6 +308,7 @@ pub enum MumbleMessage {
     PermissionDenied(crate::proto::mumble::PermissionDenied),
     CodecVersion(CodecVersion),
     VoiceTarget(VoiceTarget),
+    ServerConfig(ServerConfig),
     /// Message type not yet modeled by this enum.
     Unknown(MessageEnvelope),
 }
@@ -326,6 +332,7 @@ impl MumbleMessage {
             MumbleMessage::CryptSetup(_) => TcpMessageKind::CryptSetup,
             MumbleMessage::CodecVersion(_) => TcpMessageKind::CodecVersion,
             MumbleMessage::VoiceTarget(_) => TcpMessageKind::VoiceTarget,
+            MumbleMessage::ServerConfig(_) => TcpMessageKind::ServerConfig,
             MumbleMessage::Unknown(envelope) => envelope.kind,
         }
     }
@@ -353,6 +360,7 @@ impl MumbleMessage {
             }
             MumbleMessage::CodecVersion(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
             MumbleMessage::VoiceTarget(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
+            MumbleMessage::ServerConfig(msg) => MessageEnvelope::try_from_message(self.kind(), msg),
             MumbleMessage::Unknown(envelope) => Ok(envelope.clone()),
         }
     }
@@ -480,6 +488,12 @@ impl TryFrom<MessageEnvelope> for MumbleMessage {
                 .map(MumbleMessage::VoiceTarget)
                 .map_err(|source| MessageDecodeError::Decode {
                     kind: TcpMessageKind::VoiceTarget,
+                    source,
+                })?,
+            TcpMessageKind::ServerConfig => ServerConfig::decode(envelope.payload.as_slice())
+                .map(MumbleMessage::ServerConfig)
+                .map_err(|source| MessageDecodeError::Decode {
+                    kind: TcpMessageKind::ServerConfig,
                     source,
                 })?,
             TcpMessageKind::Unknown(_) => MumbleMessage::Unknown(envelope),
@@ -642,6 +656,48 @@ mod tests {
                 assert_eq!(decoded_vt.targets[1].children, Some(true));
             }
             other => panic!("expected VoiceTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_config_kind_roundtrips_as_id_24() {
+        let kind = TcpMessageKind::ServerConfig;
+        assert_eq!(kind.as_id(), 24);
+        assert_eq!(TcpMessageKind::from_id(24), TcpMessageKind::ServerConfig);
+    }
+
+    #[test]
+    fn server_config_message_roundtrip() {
+        use crate::proto::mumble::ServerConfig;
+
+        let sc = ServerConfig {
+            max_bandwidth: Some(72000),
+            welcome_text: Some("Welcome".into()),
+            allow_html: Some(true),
+            message_length: Some(5000),
+            image_message_length: Some(131072),
+            max_users: Some(100),
+            recording_allowed: Some(false),
+        };
+
+        let message = MumbleMessage::ServerConfig(sc.clone());
+        assert_eq!(message.kind(), TcpMessageKind::ServerConfig);
+
+        let envelope = message.encode().unwrap();
+        assert_eq!(envelope.kind, TcpMessageKind::ServerConfig);
+
+        let decoded = MumbleMessage::try_from(envelope).unwrap();
+        match decoded {
+            MumbleMessage::ServerConfig(decoded_sc) => {
+                assert_eq!(decoded_sc.max_bandwidth, Some(72000));
+                assert_eq!(decoded_sc.welcome_text, Some("Welcome".into()));
+                assert_eq!(decoded_sc.allow_html, Some(true));
+                assert_eq!(decoded_sc.message_length, Some(5000));
+                assert_eq!(decoded_sc.image_message_length, Some(131072));
+                assert_eq!(decoded_sc.max_users, Some(100));
+                assert_eq!(decoded_sc.recording_allowed, Some(false));
+            }
+            other => panic!("expected ServerConfig, got {other:?}"),
         }
     }
 }
