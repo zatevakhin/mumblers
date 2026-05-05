@@ -2,7 +2,6 @@ use std::convert::TryFrom;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-#[cfg(feature = "audio")]
 use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
@@ -149,6 +148,10 @@ impl MumbleConnection {
             ));
         }
 
+        if self.config.reconnect {
+            return Err(MumbleError::Unimplemented("automatic reconnect"));
+        }
+
         let tcp_future = TcpStream::connect((self.config.host.as_str(), self.config.port));
         let tcp_stream = match timeout(self.config.connect_timeout, tcp_future).await {
             Ok(Ok(stream)) => stream,
@@ -237,6 +240,7 @@ impl MumbleConnection {
                                 server_nonce: server.clone().try_into().unwrap(),
                             };
                             state.udp = Some(params);
+                            state.udp_ready = false;
                             drop(state);
                             self.udp_ready.notify_waiters();
                             Some(())
@@ -313,10 +317,6 @@ impl MumbleConnection {
 
         self.spawn_connection_task(tls_stream).await?;
 
-        if self.config.reconnect {
-            self.spawn_reconnect_task();
-        }
-
         Ok(())
     }
 
@@ -343,6 +343,7 @@ impl MumbleConnection {
         self.connect().await
     }
 
+    #[allow(dead_code)]
     fn spawn_reconnect_task(&self) {
         let shared_state = Arc::clone(&self.shared_state);
         let event_tx = self.event_tx.clone();
@@ -449,6 +450,7 @@ impl MumbleConnection {
         &self,
         message: crate::messages::MumbleMessage,
     ) -> Result<(), MumbleError> {
+        self.ensure_connected().await?;
         if let Some(tx) = &self.command_tx {
             tx.send(ConnectionCommand::Message(Box::new(message)))
                 .await
@@ -595,48 +597,50 @@ impl MumbleConnection {
         self.shared_state.lock().await.udp.clone()
     }
 
-    /// Block until UDP CryptSetup parameters are available (or timeout elapses).
+    /// Block until the UDP tunnel is ready (or timeout elapses).
     pub async fn wait_for_udp_ready(&self, timeout: Option<Duration>) -> Result<(), MumbleError> {
         if !self.config.enable_udp {
             return Err(MumbleError::InvalidConfig(
                 "UDP support disabled in connection config".into(),
             ));
         }
-        if self.shared_state.lock().await.udp.is_some() {
-            return Ok(());
-        }
 
         let notify = self.udp_ready.clone();
         let wait = async {
             loop {
-                notify.notified().await;
-                if self.shared_state.lock().await.udp.is_some() {
-                    return;
+                let notified = notify.notified();
+                tokio::pin!(notified);
+
+                let state = self.shared_state.lock().await;
+                if !state.is_connected {
+                    return Err(MumbleError::ConnectionLost("not connected"));
                 }
+                if state.udp_ready {
+                    return Ok(());
+                }
+                drop(state);
+
+                notified.await;
             }
         };
 
         match timeout {
             Some(limit) => tokio::time::timeout(limit, wait)
                 .await
-                .map_err(|_| MumbleError::Timeout("timed out waiting for UDP CryptSetup".into())),
-            None => {
-                wait.await;
-                Ok(())
-            }
+                .map_err(|_| MumbleError::Timeout("timed out waiting for UDP tunnel".into()))?,
+            None => wait.await,
         }
     }
 
     /// Send a ping message immediately and update latency statistics.
     pub async fn send_ping(&mut self) -> Result<(), MumbleError> {
+        self.ensure_connected().await?;
         if let Some(tx) = &self.command_tx {
             tx.send(ConnectionCommand::Ping)
                 .await
                 .map_err(|_| MumbleError::ConnectionLost("connection task stopped"))?
         } else {
-            return Err(MumbleError::InvalidConfig(
-                "connection not established".into(),
-            ));
+            return Err(MumbleError::ConnectionLost("not connected"));
         }
         Ok(())
     }
@@ -648,14 +652,16 @@ impl MumbleConnection {
                 "UDP support disabled in connection config".into(),
             ));
         }
+        self.ensure_connected().await?;
+        if !self.shared_state.lock().await.udp_ready {
+            return Err(MumbleError::ConnectionLost("UDP tunnel not ready"));
+        }
         if let Some(tx) = &self.command_tx {
             tx.send(ConnectionCommand::Audio(packet))
                 .await
                 .map_err(|_| MumbleError::ConnectionLost("connection task stopped"))?;
         } else {
-            return Err(MumbleError::InvalidConfig(
-                "connection not established".into(),
-            ));
+            return Err(MumbleError::ConnectionLost("not connected"));
         }
         Ok(())
     }
@@ -906,6 +912,14 @@ impl MumbleConnection {
         self.connection_task = Some(handle);
         Ok(())
     }
+
+    async fn ensure_connected(&self) -> Result<(), MumbleError> {
+        if self.shared_state.lock().await.is_connected {
+            Ok(())
+        } else {
+            Err(MumbleError::ConnectionLost("not connected"))
+        }
+    }
 }
 
 impl Drop for MumbleConnection {
@@ -947,7 +961,21 @@ fn apply_latency_metrics(state: &mut ClientState, ping: &crate::proto::mumble::P
     }
 }
 
+#[cfg(not(test))]
 const PING_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const PING_TIMEOUT: Duration = Duration::from_millis(50);
+
+enum ConnectionLoopExit {
+    Local,
+    Abnormal(&'static str),
+}
+
+impl ConnectionLoopExit {
+    fn abnormal(reason: &'static str) -> Self {
+        Self::Abnormal(reason)
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn connection_loop(
@@ -1017,6 +1045,10 @@ async fn connection_loop(
                 Ok(tunnel) => {
                     tracing::info!("UDP tunnel established");
                     udp_tunnel = Some(tunnel);
+                    let mut guard = state.lock().await;
+                    guard.udp_ready = true;
+                    drop(guard);
+                    udp_ready.notify_waiters();
                 }
                 Err(err) => tracing::warn!("failed to start UDP tunnel: {err}"),
             }
@@ -1024,35 +1056,27 @@ async fn connection_loop(
     }
 
     let mut ticker = interval(interval_duration);
-    loop {
+    let mut last_inbound_ping = Instant::now();
+    let exit_reason = loop {
         tokio::select! {
             _ = ticker.tick() => {
-                // Check for ping timeout
-                {
-                    let guard = state.lock().await;
-                    if let Some(last_ms) = guard.last_ping_received_ms {
-                        let elapsed = (current_millis() as u128).saturating_sub(last_ms);
-                        if elapsed > PING_TIMEOUT.as_millis() {
-                            tracing::warn!(
-                                elapsed_ms = elapsed,
-                                "client: ping timeout, disconnecting"
-                            );
-                            let _ = event_tx.send(MumbleEvent::Disconnected {
-                                reason: "ping timeout".to_string(),
-                            });
-                            break;
-                        }
-                    }
+                let elapsed = last_inbound_ping.elapsed();
+                if elapsed > PING_TIMEOUT {
+                    tracing::warn!(
+                        elapsed_ms = elapsed.as_millis(),
+                        "client: ping timeout, disconnecting"
+                    );
+                    break ConnectionLoopExit::abnormal("ping timeout");
                 }
                 if send_ping_internal(&mut writer, &state).await.is_err() {
-                    break;
+                    break ConnectionLoopExit::abnormal("failed to send ping");
                 }
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(ConnectionCommand::Ping) => {
                         if send_ping_internal(&mut writer, &state).await.is_err() {
-                            break;
+                            break ConnectionLoopExit::abnormal("failed to send ping");
                         }
                     }
                      Some(ConnectionCommand::Audio(packet)) => {
@@ -1065,23 +1089,28 @@ async fn connection_loop(
                           }
                       }
                      Some(ConnectionCommand::Message(message)) => {
-                         if let Err(err) = crate::messages::write_message(&mut writer, &message).await {
-                              tracing::warn!("failed to send message: {err}");
+                          if let Err(err) = crate::messages::write_message(&mut writer, &message).await {
+                               tracing::warn!("failed to send message: {err}");
+                               break ConnectionLoopExit::abnormal("failed to send message");
                           }
                       }
-                    None => break,
+                    None => break ConnectionLoopExit::Local,
                 }
             }
             resync = resync_rx.recv() => {
                 if resync.is_some() {
                     if let Err(err) = send_cryptsetup_request(&mut writer).await {
                         tracing::warn!("failed to request UDP resync: {err}");
+                        break ConnectionLoopExit::abnormal("failed to request UDP resync");
                     }
                 }
             }
             inbound = inbound_rx.recv() => {
                 match inbound {
                     Some(Ok(envelope)) => {
+                        if envelope.kind == TcpMessageKind::Ping {
+                            last_inbound_ping = Instant::now();
+                        }
                         let conn_session = {
                             let guard = state.lock().await;
                             guard.session_id
@@ -1100,22 +1129,26 @@ async fn connection_loop(
                         )
                         .await
                         {
-                            handle_crypt_update(
-                                update,
-                                &state,
-                                &event_tx,
+                            if let Err(reason) = handle_crypt_update(
+                                 update,
+                                 &state,
+                                 &event_tx,
                                 &udp_options,
                                 &mut udp_tunnel,
                                 &mut tcp_tunnel_crypt,
+                                &udp_ready,
                                 &mut writer,
                                 &resync_tx,
                                 udp_resync_interval,
-                                #[cfg(feature = "audio")]
-                                playback.clone(),
-                            )
-                            .await;
-                        }
-                    }
+                                 #[cfg(feature = "audio")]
+                                 playback.clone(),
+                             )
+                             .await
+                             {
+                                 break ConnectionLoopExit::abnormal(reason);
+                             }
+                         }
+                     }
                     Some(Err(err)) => {
                         let conn_session = {
                             let guard = state.lock().await;
@@ -1126,20 +1159,37 @@ async fn connection_loop(
                             error = ?err,
                             "client: read_envelope failed, terminating connection loop"
                         );
-                        break;
+                        break ConnectionLoopExit::abnormal("tcp read failed");
                     }
-                    None => break,
+                    None => break ConnectionLoopExit::abnormal("tcp reader stopped"),
                 }
             }
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
-                    break;
+                    break ConnectionLoopExit::Local;
+                } else if changed.is_err() {
+                    break ConnectionLoopExit::Local;
                 }
             }
         }
-    }
+    };
 
     reader_task.abort();
+
+    {
+        let mut guard = state.lock().await;
+        guard.is_connected = false;
+        guard.udp = None;
+        guard.udp_ready = false;
+        guard.last_ping_received_ms = None;
+    }
+    udp_ready.notify_waiters();
+
+    if let ConnectionLoopExit::Abnormal(reason) = exit_reason {
+        let _ = event_tx.send(MumbleEvent::Disconnected {
+            reason: reason.to_string(),
+        });
+    }
 }
 
 async fn send_ping_internal<W>(writer: &mut W, state: &Arc<Mutex<ClientState>>) -> Result<(), ()>
@@ -1426,6 +1476,7 @@ fn update_udp_state_with_cryptsetup(
                 server_nonce: slice_to_array(server),
             };
             state.udp = Some(params.clone());
+            state.udp_ready = false;
             return Some(CryptUpdate::Full(params));
         }
     }
@@ -1513,6 +1564,7 @@ async fn ensure_udp_state(state: &Arc<Mutex<ClientState>>) -> UdpState {
     }
     let generated = generate_udp_state();
     guard.udp = Some(generated.clone());
+    guard.udp_ready = false;
     generated
 }
 
@@ -1566,11 +1618,12 @@ async fn handle_crypt_update(
     udp_options: &UdpOptions,
     udp_tunnel: &mut Option<UdpTunnel>,
     tcp_tunnel_crypt: &mut Option<CryptStateOcb2>,
+    udp_ready: &tokio::sync::Notify,
     writer: &mut (impl AsyncWrite + Unpin),
     resync_tx: &mpsc::Sender<()>,
     udp_resync_interval: Duration,
     #[cfg(feature = "audio")] playback: Option<Arc<AudioPlaybackManager>>,
-) {
+) -> Result<(), &'static str> {
     match update {
         CryptUpdate::Full(params) => {
             // Keep a TCP-tunnel decrypt state in sync even if UDP is disabled.
@@ -1581,7 +1634,7 @@ async fn handle_crypt_update(
             let arc_params = Arc::new(params.clone());
 
             if !udp_options.enable {
-                return;
+                return Ok(());
             }
 
             if let Some(tunnel) = udp_tunnel.as_ref() {
@@ -1603,6 +1656,10 @@ async fn handle_crypt_update(
                     Ok(tunnel) => {
                         tracing::info!("UDP tunnel established");
                         *udp_tunnel = Some(tunnel);
+                        let mut guard = state.lock().await;
+                        guard.udp_ready = true;
+                        drop(guard);
+                        udp_ready.notify_waiters();
                     }
                     Err(err) => tracing::warn!("failed to start UDP tunnel: {err}"),
                 }
@@ -1622,7 +1679,7 @@ async fn handle_crypt_update(
             }
 
             if !udp_options.enable {
-                return;
+                return Ok(());
             }
 
             if udp_tunnel.is_none() {
@@ -1645,6 +1702,10 @@ async fn handle_crypt_update(
                             Ok(tunnel) => {
                                 tracing::info!("UDP tunnel established");
                                 *udp_tunnel = Some(tunnel);
+                                let mut guard = state.lock().await;
+                                guard.udp_ready = true;
+                                drop(guard);
+                                udp_ready.notify_waiters();
                             }
                             Err(err) => tracing::warn!("failed to start UDP tunnel: {err}"),
                         }
@@ -1664,15 +1725,16 @@ async fn handle_crypt_update(
 
             if let Err(err) = send_udp_state_message(writer, state, false, true).await {
                 tracing::warn!("failed to acknowledge UDP resync: {err}");
+                return Err("failed to acknowledge UDP resync");
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn latency_metrics_update_average() {

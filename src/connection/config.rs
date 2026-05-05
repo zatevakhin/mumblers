@@ -49,7 +49,7 @@ pub struct ConnectionConfig {
     pub client_type: ClientType,
     /// Enable UDP voice tunnel negotiation once CryptSetup is received.
     pub enable_udp: bool,
-    /// Enable automatic reconnection on disconnect.
+    /// Enable automatic reconnection on disconnect (currently unsupported).
     pub reconnect: bool,
     /// Interval between reconnection attempts.
     pub reconnect_interval: Duration,
@@ -200,7 +200,7 @@ impl ConnectionConfigBuilder {
         self
     }
 
-    /// Enable automatic reconnection on disconnect.
+    /// Enable automatic reconnection on disconnect (currently returns Unimplemented).
     pub fn reconnect(mut self, enable: bool) -> Self {
         self.config.reconnect = enable;
         self

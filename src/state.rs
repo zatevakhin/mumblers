@@ -91,6 +91,8 @@ pub struct ClientState {
     pub server_config: Option<crate::proto::mumble::ServerConfig>,
     /// Cryptographic parameters provided via CryptSetup for the UDP tunnel.
     pub udp: Option<UdpState>,
+    /// True once the UDP tunnel has been started for current UDP parameters.
+    pub udp_ready: bool,
     /// Channel hierarchy and management.
     pub channels: SharedChannels,
 }
@@ -141,6 +143,7 @@ impl Default for ClientState {
             codec_version: None,
             server_config: None,
             udp: None,
+            udp_ready: false,
             channels: crate::channels::new_shared_channels(),
         }
     }

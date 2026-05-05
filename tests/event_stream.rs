@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use mumblers::audio::{AudioHeader, VoicePacket};
 use mumblers::connection::MumbleEvent;
+use mumblers::error::MumbleError;
 use mumblers::messages::{MessageEnvelope, MumbleMessage, TcpMessageKind};
 use mumblers::proto::mumble::{ChannelState, ServerSync, TextMessage, UserState, Version};
 use mumblers::{ConnectionConfig, MumbleConnection};
@@ -184,6 +186,87 @@ impl MockMumbleServer {
 
     fn addr(&self) -> &str {
         &self.addr
+    }
+}
+
+async fn start_server_that_closes_after_handshake() -> MockMumbleServer {
+    let (shutdown_tx, _) = broadcast::channel(1);
+    let cert = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.serialize_private_key_der().into());
+    let cert_chain = vec![rustls::pki_types::CertificateDer::from(
+        cert.serialize_der().unwrap(),
+    )];
+
+    let tls_config = TlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)
+        .unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut shutdown_rx = shutdown_tx.subscribe();
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {},
+            res = listener.accept() => {
+                if let Ok((stream, _)) = res {
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        let stream = acceptor.accept(stream).await.unwrap();
+                        let (mut reader, mut writer) = tokio::io::split(stream);
+
+                        let _ = mumblers::messages::read_envelope(&mut reader).await.unwrap();
+                        let _ = mumblers::messages::read_envelope(&mut reader).await.unwrap();
+                        let _ = mumblers::messages::read_envelope(&mut reader).await.unwrap();
+
+                        let version = Version {
+                            version_v1: Some(1),
+                            ..Default::default()
+                        };
+                        MessageEnvelope::try_from_message(TcpMessageKind::Version, &version)
+                            .unwrap()
+                            .write_to(&mut writer)
+                            .await
+                            .unwrap();
+
+                        let server_sync = ServerSync {
+                            session: Some(1),
+                            ..Default::default()
+                        };
+                        MessageEnvelope::try_from_message(TcpMessageKind::ServerSync, &server_sync)
+                            .unwrap()
+                            .write_to(&mut writer)
+                            .await
+                            .unwrap();
+
+                        let _ = mumblers::messages::read_envelope(&mut reader).await;
+                    });
+                }
+            }
+        }
+    });
+
+    MockMumbleServer { addr, shutdown_tx }
+}
+
+fn assert_connection_lost(result: Result<(), MumbleError>) {
+    assert!(
+        matches!(result, Err(MumbleError::ConnectionLost(_))),
+        "expected ConnectionLost, got {result:?}"
+    );
+}
+
+fn sample_voice_packet() -> VoicePacket {
+    VoicePacket {
+        header: AudioHeader::Target(0),
+        sender_session: None,
+        frame_number: 0,
+        opus_data: vec![0; 4],
+        positional_data: None,
+        volume_adjustment: None,
+        is_terminator: false,
     }
 }
 
@@ -437,4 +520,148 @@ async fn test_mute_deaf_operations() {
 
     // Undeafen user
     connection.undeafen_user(1).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_server_close_emits_disconnected_and_clears_state() {
+    let server = start_server_that_closes_after_handshake().await;
+    let host_port: Vec<&str> = server.addr().split(':').collect();
+    let host = host_port[0];
+    let port = host_port[1].parse().unwrap();
+
+    let config = ConnectionConfig::builder(host)
+        .port(port)
+        .accept_invalid_certs(true)
+        .enable_udp(true)
+        .build();
+
+    let mut connection = MumbleConnection::new(config);
+    let mut events = connection.subscribe_events();
+
+    connection.connect().await.unwrap();
+
+    let disconnected = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let MumbleEvent::Disconnected { reason } = events.recv().await.unwrap() {
+                break reason;
+            }
+        }
+    })
+    .await
+    .expect("disconnected event");
+
+    assert!(!disconnected.is_empty());
+    let state = connection.state().await;
+    assert!(!state.is_connected);
+    assert!(state.udp.is_none());
+    assert!(state.last_ping_received_ms.is_none());
+}
+
+#[tokio::test]
+async fn test_send_audio_fails_before_udp_ready() {
+    let server = MockMumbleServer::new().await;
+    let host_port: Vec<&str> = server.addr().split(':').collect();
+    let host = host_port[0];
+    let port = host_port[1].parse().unwrap();
+
+    let config = ConnectionConfig::builder(host)
+        .port(port)
+        .accept_invalid_certs(true)
+        .enable_udp(true)
+        .build();
+
+    let mut connection = MumbleConnection::new(config);
+    connection.connect().await.unwrap();
+
+    assert_connection_lost(connection.send_audio(sample_voice_packet()).await);
+}
+
+#[tokio::test]
+async fn test_send_apis_fail_after_disconnect_cleanup() {
+    let server = start_server_that_closes_after_handshake().await;
+    let host_port: Vec<&str> = server.addr().split(':').collect();
+    let host = host_port[0];
+    let port = host_port[1].parse().unwrap();
+
+    let config = ConnectionConfig::builder(host)
+        .port(port)
+        .accept_invalid_certs(true)
+        .enable_udp(true)
+        .build();
+
+    let mut connection = MumbleConnection::new(config);
+    let mut events = connection.subscribe_events();
+
+    connection.connect().await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap(),
+                MumbleEvent::Disconnected { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("disconnected event");
+
+    assert_connection_lost(
+        connection
+            .send_message(MumbleMessage::TextMessage(TextMessage::default()))
+            .await,
+    );
+    assert_connection_lost(connection.send_ping().await);
+    assert_connection_lost(connection.send_audio(sample_voice_packet()).await);
+}
+
+#[tokio::test]
+async fn test_wait_for_udp_ready_returns_connection_lost_after_disconnect() {
+    let server = start_server_that_closes_after_handshake().await;
+    let host_port: Vec<&str> = server.addr().split(':').collect();
+    let host = host_port[0];
+    let port = host_port[1].parse().unwrap();
+
+    let config = ConnectionConfig::builder(host)
+        .port(port)
+        .accept_invalid_certs(true)
+        .enable_udp(true)
+        .build();
+
+    let mut connection = MumbleConnection::new(config);
+    let mut events = connection.subscribe_events();
+    connection.connect().await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap(),
+                MumbleEvent::Disconnected { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("disconnected event");
+
+    let result = tokio::time::timeout(Duration::from_secs(1), connection.wait_for_udp_ready(None))
+        .await
+        .expect("wait_for_udp_ready should not hang");
+
+    assert_connection_lost(result);
+}
+
+#[tokio::test]
+async fn test_reconnect_config_is_explicitly_unsupported() {
+    let config = ConnectionConfig::builder("127.0.0.1")
+        .reconnect(true)
+        .build();
+    let mut connection = MumbleConnection::new(config);
+
+    assert!(matches!(
+        connection.connect().await,
+        Err(MumbleError::Unimplemented("automatic reconnect"))
+    ));
 }
