@@ -1165,9 +1165,7 @@ async fn connection_loop(
                 }
             }
             changed = shutdown.changed() => {
-                if changed.is_ok() && *shutdown.borrow() {
-                    break ConnectionLoopExit::Local;
-                } else if changed.is_err() {
+                if changed.is_err() || *shutdown.borrow() {
                     break ConnectionLoopExit::Local;
                 }
             }
