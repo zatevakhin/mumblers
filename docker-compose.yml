@@ -1,0 +1,25 @@
+services:
+  mumblers:
+    build:
+      dockerfile: docker/Dockerfile
+      context: .
+    image: mumblers:latest
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      MUMBLE_BIND_HOST: 0.0.0.0
+      MUMBLE_BIND_PORT: 64738
+      MUMBLE_UDP_BIND_PORT: 64738
+      MUMBLE_SERVER_NAME: mumblers
+      MUMBLE_ALLOW_ANONYMOUS: "true"
+    ports:
+      - "64738:64738/tcp"
+      - "64738:64738/udp"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
