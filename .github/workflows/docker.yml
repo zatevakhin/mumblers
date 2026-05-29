@@ -24,6 +24,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Read crate version
+        id: version
+        shell: bash
+        run: echo "version=$(awk -F'\"' '/^version = / { print $2; exit }' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
@@ -46,7 +51,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
+            type=raw,value=v${{ steps.version.outputs.version }}
 
       - name: Build and push image
         uses: docker/build-push-action@v6

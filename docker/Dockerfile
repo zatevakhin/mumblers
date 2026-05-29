@@ -20,7 +20,7 @@ RUN addgroup -S -g 1000 mumblers \
 
 WORKDIR /data
 
-ENV MUMBLERS_CONFIG=/data/mumblers.toml
+ENV MUMBLERS_CONFIG=mumblers.toml
 ENV MUMBLERS_CERT_PATH=/data/certs/mumblers.crt
 ENV MUMBLE_BIND_HOST=0.0.0.0
 ENV MUMBLE_BIND_PORT=64738
@@ -41,7 +41,7 @@ EXPOSE 64738/tcp 64738/udp
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
-  CMD /bin/busybox nc -z 127.0.0.1 64738 || exit 1
+  CMD /bin/busybox pidof mumblersd >/dev/null || exit 1
 
 USER mumblers
 
