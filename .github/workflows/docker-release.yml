@@ -34,13 +34,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Read crate version
+        id: version
+        shell: bash
+        run: echo "version=$(awk -F'\"' '/^version = / { print $2; exit }' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=tag
+            type=raw,value=v${{ steps.version.outputs.version }}
             type=raw,value=latest
 
       - name: Build and push image
