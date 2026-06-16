@@ -266,6 +266,80 @@ async fn voice_roundtrip() {
 }
 
 #[tokio::test]
+async fn voice_continues_after_many_zero_heavy_frames() {
+    init_tracing();
+
+    let (alice, bob, alice_session, _) = connect_pair().await;
+
+    let mut bob_rx = bob.subscribe_events();
+    while let Ok(_) = bob_rx.try_recv() {}
+
+    // Bob only needs to send once so the server knows his UDP endpoint.
+    bob.send_audio(VoicePacket {
+        header: AudioHeader::Target(0),
+        sender_session: None,
+        frame_number: 0,
+        opus_data: vec![0],
+        positional_data: None,
+        volume_adjustment: None,
+        is_terminator: false,
+    })
+    .await
+    .expect("bob sends priming audio");
+    sleep(Duration::from_millis(50)).await;
+    while let Ok(_) = bob_rx.try_recv() {}
+
+    // These packets serialize with a full zero block immediately before the
+    // trailing OCB block. They used to trigger local encryption drops that
+    // moved the server out of decrypt range over time.
+    let zero_heavy_payload = vec![0; 26];
+    for frame in 1..=140u64 {
+        alice
+            .send_audio(VoicePacket {
+                header: AudioHeader::Target(0),
+                sender_session: None,
+                frame_number: frame,
+                opus_data: zero_heavy_payload.clone(),
+                positional_data: None,
+                volume_adjustment: None,
+                is_terminator: false,
+            })
+            .await
+            .expect("alice queues zero-heavy audio");
+    }
+
+    let packet = VoicePacket {
+        header: AudioHeader::Target(0),
+        sender_session: None,
+        frame_number: 141,
+        opus_data: vec![1, 2, 3, 4],
+        positional_data: None,
+        volume_adjustment: None,
+        is_terminator: false,
+    };
+    alice
+        .send_audio(packet.clone())
+        .await
+        .expect("alice sends recovery audio");
+
+    let audio_ev = wait_for_event(&mut bob_rx, Duration::from_secs(5), |ev| {
+        matches!(ev, MumbleEvent::UdpAudio(pkt) if pkt.sender_session == Some(alice_session) && pkt.frame_number == packet.frame_number)
+    })
+    .await
+    .expect("bob should still observe audio after many zero-heavy frames");
+
+    match audio_ev {
+        MumbleEvent::UdpAudio(recv) => {
+            assert_eq!(recv.sender_session, Some(alice_session));
+            assert_eq!(recv.frame_number, packet.frame_number);
+            assert_eq!(recv.header, AudioHeader::Context(0));
+            assert_eq!(recv.opus_data, packet.opus_data);
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
 async fn voice_out_of_order_delivery() {
     init_tracing();
 

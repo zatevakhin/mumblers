@@ -1,9 +1,11 @@
 use aes::Aes128;
 use cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use rand::{rngs::OsRng, RngCore};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 const BLOCK_SIZE: usize = 16;
+static WARNED_XEX_STAR_MITIGATION: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, thiserror::Error)]
 pub enum EncryptError {
@@ -84,8 +86,8 @@ impl CryptStateOcb2 {
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptError> {
         let mut iv = self.encrypt_iv;
         increment_iv(&mut iv, 0);
+        let (cipher, tag) = ocb_encrypt(&self.aes, plaintext, &iv, true)?;
         self.encrypt_iv = iv;
-        let (cipher, tag) = ocb_encrypt(&self.aes, plaintext, &iv, false)?;
         let mut out = Vec::with_capacity(4 + cipher.len());
         out.push(iv[0]);
         out.extend_from_slice(&tag[..3]);
@@ -195,32 +197,43 @@ fn ocb_encrypt(
     aes: &Aes128,
     plain: &[u8],
     nonce: &[u8; BLOCK_SIZE],
-    insecure: bool,
+    modify_plain_on_xex_star_attack: bool,
 ) -> Result<(Vec<u8>, [u8; BLOCK_SIZE]), EncryptError> {
     let mut delta = encrypt_block(aes, nonce);
     let mut checksum = [0u8; BLOCK_SIZE];
     let mut encrypted = vec![0u8; plain.len()];
     let mut pos = 0;
-    let mut last_full_block: Option<[u8; BLOCK_SIZE]> = None;
 
     while plain.len() - pos > BLOCK_SIZE {
         let mut block = [0u8; BLOCK_SIZE];
         block.copy_from_slice(&plain[pos..pos + BLOCK_SIZE]);
-        delta = s2(&delta);
-        let tmp = xor_block(&delta, &block);
-        let enc = xor_block(&delta, &encrypt_block(aes, &tmp));
-        checksum = xor_block(&checksum, &block);
-        encrypted[pos..pos + BLOCK_SIZE].copy_from_slice(&enc);
-        pos += BLOCK_SIZE;
-        last_full_block = Some(block);
-    }
-
-    if !insecure {
-        if let Some(block) = last_full_block {
-            if block[..BLOCK_SIZE - 1].iter().all(|&b| b == 0) {
+        let mut flip_bit = false;
+        if plain.len() - pos <= BLOCK_SIZE * 2 && block[..BLOCK_SIZE - 1].iter().all(|&b| b == 0) {
+            if modify_plain_on_xex_star_attack {
+                flip_bit = true;
+                if !WARNED_XEX_STAR_MITIGATION.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        plaintext_len = plain.len(),
+                        "OCB2 XEX* critical plaintext encountered; mutating one bit to keep UDP audio synchronized"
+                    );
+                }
+            } else {
                 return Err(EncryptError::InsecureInput);
             }
         }
+
+        delta = s2(&delta);
+        let mut tmp = xor_block(&delta, &block);
+        if flip_bit {
+            tmp[0] ^= 1;
+        }
+        let enc = xor_block(&delta, &encrypt_block(aes, &tmp));
+        checksum = xor_block(&checksum, &block);
+        if flip_bit {
+            checksum[0] ^= 1;
+        }
+        encrypted[pos..pos + BLOCK_SIZE].copy_from_slice(&enc);
+        pos += BLOCK_SIZE;
     }
 
     let len_remaining = plain.len() - pos;
@@ -386,5 +399,42 @@ mod tests {
         let plain = dec.decrypt(&cipher).unwrap();
 
         assert_eq!(plain, payload);
+    }
+
+    #[test]
+    fn ocb_encrypt_strict_rejects_xex_star_candidate() {
+        let key = [0x11u8; 16];
+        let nonce = [0x22u8; 16];
+        let mut cipher = CryptStateOcb2::new();
+        cipher.set_key(&key, &nonce, &nonce);
+
+        let payload = vec![0; 26];
+        let before = cipher.encrypt_iv();
+        assert!(matches!(
+            ocb_encrypt(&cipher.aes, &payload, &nonce, false),
+            Err(EncryptError::InsecureInput)
+        ));
+        assert_eq!(cipher.encrypt_iv(), before);
+    }
+
+    #[test]
+    fn crypt_state_roundtrip_many_xex_star_candidates() {
+        let mut enc = CryptStateOcb2::new();
+        let mut dec = CryptStateOcb2::new();
+        dec.set_key(&enc.raw_key(), &enc.decrypt_iv(), &enc.encrypt_iv());
+
+        let payload = vec![0; 26];
+        for _ in 0..140 {
+            let cipher = enc.encrypt(&payload).unwrap();
+            let plain = dec.decrypt(&cipher).unwrap();
+            assert_eq!(plain.len(), payload.len());
+            assert_eq!(&plain[1..], &payload[1..]);
+            assert_ne!(plain[0], payload[0]);
+        }
+
+        let recovery = b"voice payload data";
+        let cipher = enc.encrypt(recovery).unwrap();
+        let plain = dec.decrypt(&cipher).unwrap();
+        assert_eq!(plain, recovery);
     }
 }
