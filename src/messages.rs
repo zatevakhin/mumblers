@@ -519,17 +519,20 @@ mod tests {
     use tokio::io::{duplex, AsyncWriteExt};
 
     fn golden_version_message() -> Version {
-        let mut version = Version::default();
-        version.version_v1 = Some(1);
-        version.release = Some("rs".into());
-        version
+        Version {
+            version_v1: Some(1),
+            release: Some("rs".into()),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn decode_version_payload() {
-        let mut version = Version::default();
-        version.version_v1 = Some(0x0105_00ff);
-        version.release = Some("mumble-rs".into());
+        let version = Version {
+            version_v1: Some(0x0105_00ff),
+            release: Some("mumble-rs".into()),
+            ..Default::default()
+        };
 
         let envelope = MessageEnvelope::try_from_message(TcpMessageKind::Version, &version)
             .expect("encoding should succeed");
@@ -542,8 +545,10 @@ mod tests {
     async fn write_and_read_roundtrip() {
         let (mut tx, mut rx) = duplex(64);
 
-        let mut version = Version::default();
-        version.version_v1 = Some(0x0105_0001);
+        let version = Version {
+            version_v1: Some(0x0105_0001),
+            ..Default::default()
+        };
 
         let envelope = MessageEnvelope::try_from_message(TcpMessageKind::Version, &version)
             .expect("encoding should succeed");

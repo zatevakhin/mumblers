@@ -60,7 +60,7 @@ impl Recorder {
     }
 
     fn finalize(self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut writer = self.writer.into_inner();
+        let writer = self.writer.into_inner();
         writer.finalize()?;
         Ok(())
     }

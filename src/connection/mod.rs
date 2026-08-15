@@ -1165,9 +1165,7 @@ async fn connection_loop(
                 }
             }
             changed = shutdown.changed() => {
-                if changed.is_ok() && *shutdown.borrow() {
-                    break ConnectionLoopExit::Local;
-                } else if changed.is_err() {
+                if changed.is_err() || *shutdown.borrow() {
                     break ConnectionLoopExit::Local;
                 }
             }
@@ -1738,11 +1736,14 @@ mod tests {
 
     #[test]
     fn latency_metrics_update_average() {
-        let mut state = ClientState::default();
-        state.ping_received = 1;
-        state.ping_average_ms = 0.0;
-        let mut ping = crate::proto::mumble::Ping::default();
-        ping.timestamp = Some(current_millis().saturating_sub(5));
+        let mut state = ClientState {
+            ping_received: 1,
+            ..Default::default()
+        };
+        let ping = crate::proto::mumble::Ping {
+            timestamp: Some(current_millis().saturating_sub(5)),
+            ..Default::default()
+        };
         apply_latency_metrics(&mut state, &ping);
         assert!(state.last_ping_received_ms.is_some());
         assert!(state.ping_average_ms >= 0.0);
@@ -1769,10 +1770,12 @@ mod tests {
     async fn handle_pong_emits_event() {
         let connection = MumbleConnection::new(ConnectionConfig::new("localhost"));
         let mut receiver = connection.subscribe_events();
-        let mut ping = crate::proto::mumble::Ping::default();
-        ping.timestamp = Some(super::current_millis());
+        let ping = crate::proto::mumble::Ping {
+            timestamp: Some(super::current_millis()),
+            ..Default::default()
+        };
 
-        connection.handle_pong(ping.clone()).await;
+        connection.handle_pong(ping).await;
 
         match receiver.recv().await.expect("event available") {
             MumbleEvent::Ping { message, .. } => assert_eq!(message, ping),
@@ -1785,10 +1788,11 @@ mod tests {
         let state = Arc::new(Mutex::new(ClientState::default()));
         let (event_tx, mut event_rx) = broadcast::channel(4);
 
-        let mut crypt = CryptSetup::default();
-        crypt.key = Some(vec![1; 16]);
-        crypt.client_nonce = Some(vec![2; 16]);
-        crypt.server_nonce = Some(vec![3; 16]);
+        let crypt = CryptSetup {
+            key: Some(vec![1; 16]),
+            client_nonce: Some(vec![2; 16]),
+            server_nonce: Some(vec![3; 16]),
+        };
         let envelope =
             MessageEnvelope::try_from_message(TcpMessageKind::CryptSetup, &crypt).unwrap();
 

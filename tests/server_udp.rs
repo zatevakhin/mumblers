@@ -32,8 +32,10 @@ async fn cryptsetup_after_auth_and_resync() {
 
     // We don't have direct writer access; reuse the connection's internal send_message
     let new_client_nonce = vec![0xAB; 16];
-    let mut cs = CryptSetup::default();
-    cs.client_nonce = Some(new_client_nonce.clone());
+    let cs = CryptSetup {
+        client_nonce: Some(new_client_nonce.clone()),
+        ..Default::default()
+    };
     c.send_message(MumbleMessage::CryptSetup(cs))
         .await
         .expect("send resync");

@@ -12,17 +12,19 @@ use std::collections::HashSet;
 use tokio::time::{sleep, Duration};
 
 async fn start_server() -> (u16, tokio::task::JoinHandle<()>) {
-    let mut cfg = ServerConfig::default();
-    cfg.default_channel = "Lobby".to_string();
-    cfg.channels = vec![ChannelConfig {
-        name: "Lobby".to_string(),
-        parent: Some("Root".to_string()),
-        description: None,
-        position: Some(1),
-        max_users: None,
-        noenter: None,
-        silent: None,
-    }];
+    let cfg = ServerConfig {
+        default_channel: "Lobby".to_string(),
+        channels: vec![ChannelConfig {
+            name: "Lobby".to_string(),
+            parent: Some("Root".to_string()),
+            description: None,
+            position: Some(1),
+            max_users: None,
+            noenter: None,
+            silent: None,
+        }],
+        ..Default::default()
+    };
     start_server_with_config(cfg).await
 }
 
@@ -211,7 +213,7 @@ async fn voice_roundtrip() {
     let (alice, bob, alice_session, _) = connect_pair().await;
 
     let mut bob_rx = bob.subscribe_events();
-    while let Ok(_) = bob_rx.try_recv() {}
+    while bob_rx.try_recv().is_ok() {}
 
     // Prime Bob's UDP pairing by sending a silent frame.
     let primer = VoicePacket {
@@ -227,7 +229,7 @@ async fn voice_roundtrip() {
         .await
         .expect("bob sends priming audio");
     sleep(Duration::from_millis(50)).await;
-    while let Ok(_) = bob_rx.try_recv() {}
+    while bob_rx.try_recv().is_ok() {}
 
     let packet = VoicePacket {
         header: AudioHeader::Target(0),
@@ -272,7 +274,7 @@ async fn voice_continues_after_many_zero_heavy_frames() {
     let (alice, bob, alice_session, _) = connect_pair().await;
 
     let mut bob_rx = bob.subscribe_events();
-    while let Ok(_) = bob_rx.try_recv() {}
+    while bob_rx.try_recv().is_ok() {}
 
     // Bob only needs to send once so the server knows his UDP endpoint.
     bob.send_audio(VoicePacket {
@@ -287,7 +289,7 @@ async fn voice_continues_after_many_zero_heavy_frames() {
     .await
     .expect("bob sends priming audio");
     sleep(Duration::from_millis(50)).await;
-    while let Ok(_) = bob_rx.try_recv() {}
+    while bob_rx.try_recv().is_ok() {}
 
     // These packets serialize with a full zero block immediately before the
     // trailing OCB block. They used to trigger local encryption drops that
@@ -346,7 +348,7 @@ async fn voice_out_of_order_delivery() {
     let (alice, bob, alice_session, _) = connect_pair().await;
 
     let mut bob_rx = bob.subscribe_events();
-    while let Ok(_) = bob_rx.try_recv() {}
+    while bob_rx.try_recv().is_ok() {}
 
     let primer = VoicePacket {
         header: AudioHeader::Target(0),
@@ -361,7 +363,7 @@ async fn voice_out_of_order_delivery() {
         .await
         .expect("bob sends priming audio");
     sleep(Duration::from_millis(50)).await;
-    while let Ok(_) = bob_rx.try_recv() {}
+    while bob_rx.try_recv().is_ok() {}
 
     let frames = [(1u64, vec![1u8]), (3u64, vec![3u8]), (2u64, vec![2u8])];
 
@@ -419,7 +421,7 @@ async fn voice_udp_loopback() {
     let (alice, alice_session) = connect_single().await;
 
     let mut alice_rx = alice.subscribe_events();
-    while let Ok(_) = alice_rx.try_recv() {}
+    while alice_rx.try_recv().is_ok() {}
 
     // Use server loopback target (0x1f) so a single client can verify send+receive.
     let packet = VoicePacket {
@@ -439,15 +441,14 @@ async fn voice_udp_loopback() {
             .await
             .expect("alice sends loopback audio");
 
-        if let Some(ev) = wait_for_event(&mut alice_rx, Duration::from_secs(2), |ev| {
-            matches!(ev, MumbleEvent::UdpAudio(_))
-        })
-        .await
+        if let Some(MumbleEvent::UdpAudio(pkt)) =
+            wait_for_event(&mut alice_rx, Duration::from_secs(2), |ev| {
+                matches!(ev, MumbleEvent::UdpAudio(_))
+            })
+            .await
         {
-            if let MumbleEvent::UdpAudio(pkt) = ev {
-                received = Some(pkt);
-                break;
-            }
+            received = Some(pkt);
+            break;
         }
 
         sleep(Duration::from_millis(50)).await;
@@ -467,7 +468,7 @@ async fn voice_tcp_tunnel_is_routed() {
     let (alice, bob, alice_session, _) = connect_pair_custom(true, false).await;
 
     let mut bob_rx = bob.subscribe_events();
-    while let Ok(_) = bob_rx.try_recv() {}
+    while bob_rx.try_recv().is_ok() {}
 
     let packet = VoicePacket {
         header: AudioHeader::Target(0),
@@ -514,7 +515,7 @@ async fn voice_udp_sender_reaches_tcp_only_receiver() {
     let (alice, bob, alice_session, _) = connect_pair_custom(true, false).await;
 
     let mut bob_rx = bob.subscribe_events();
-    while let Ok(_) = bob_rx.try_recv() {}
+    while bob_rx.try_recv().is_ok() {}
 
     // Bob never sends UDP, so the server should tunnel deliveries to him.
     let packet = VoicePacket {
@@ -533,18 +534,17 @@ async fn voice_udp_sender_reaches_tcp_only_receiver() {
             .send_audio(packet.clone())
             .await
             .expect("alice sends udp");
-        if let Some(ev) = wait_for_event(&mut bob_rx, Duration::from_secs(1), |ev| {
-            matches!(ev, MumbleEvent::UdpAudio(_))
-        })
-        .await
+        if let Some(MumbleEvent::UdpAudio(recv)) =
+            wait_for_event(&mut bob_rx, Duration::from_secs(1), |ev| {
+                matches!(ev, MumbleEvent::UdpAudio(_))
+            })
+            .await
         {
-            if let MumbleEvent::UdpAudio(recv) = ev {
-                assert_eq!(recv.sender_session, Some(alice_session));
-                assert_eq!(recv.frame_number, packet.frame_number);
-                assert_eq!(recv.header, AudioHeader::Context(0));
-                assert_eq!(recv.opus_data, packet.opus_data);
-                return;
-            }
+            assert_eq!(recv.sender_session, Some(alice_session));
+            assert_eq!(recv.frame_number, packet.frame_number);
+            assert_eq!(recv.header, AudioHeader::Context(0));
+            assert_eq!(recv.opus_data, packet.opus_data);
+            return;
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -583,7 +583,7 @@ async fn connect_trio() -> (
             .state()
             .await
             .session_id
-            .expect(&format!("{name} session"));
+            .unwrap_or_else(|| panic!("{name} session"));
         assert!(
             wait_for_event(&mut events, Duration::from_secs(5), |ev| matches!(
                 ev,
@@ -633,8 +633,8 @@ async fn voice_whisper_to_specific_user() {
 
     let mut bob_rx = bob.subscribe_events();
     let mut carol_rx = carol.subscribe_events();
-    while let Ok(_) = bob_rx.try_recv() {}
-    while let Ok(_) = carol_rx.try_recv() {}
+    while bob_rx.try_recv().is_ok() {}
+    while carol_rx.try_recv().is_ok() {}
 
     // Alice sends audio with target=5 (whisper to Bob only)
     let packet = VoicePacket {
@@ -760,7 +760,7 @@ async fn voice_whisper_to_channel() {
     sleep(Duration::from_millis(100)).await;
 
     let mut bob_rx = bob.subscribe_events();
-    while let Ok(_) = bob_rx.try_recv() {}
+    while bob_rx.try_recv().is_ok() {}
 
     // Alice sends audio with target=3 (whisper to Root channel)
     let packet = VoicePacket {

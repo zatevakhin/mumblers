@@ -1180,9 +1180,11 @@ mod udp_probe_tests {
         let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = client_sock.local_addr().unwrap();
 
-        let mut ping = udp_proto::Ping::default();
-        ping.timestamp = 12345;
-        ping.request_extended_information = false;
+        let ping = udp_proto::Ping {
+            timestamp: 12345,
+            request_extended_information: false,
+            ..Default::default()
+        };
         let mut payload = ping.encode_to_vec();
         payload.insert(0, UDP_MSG_TYPE_PING);
 

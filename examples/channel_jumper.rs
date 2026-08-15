@@ -62,12 +62,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let channels_guard = state.channels.lock().await;
     let mut available: Vec<(u32, String)> = channels_guard
         .iter()
-        .filter_map(|(id, chan)| {
+        .map(|(id, chan)| {
             let name = chan
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("Channel {}", id));
-            Some((*id, name))
+            (*id, name)
         })
         .collect();
     drop(channels_guard);

@@ -9,37 +9,39 @@ use mumblers::{
 use tokio::time::{sleep, Duration};
 
 async fn start_server() -> (u16, tokio::task::JoinHandle<()>) {
-    let mut cfg = ServerConfig::default();
-    cfg.default_channel = "Lobby".to_string();
-    cfg.channels = vec![
-        ChannelConfig {
-            name: "Lobby".to_string(),
-            parent: Some("Root".to_string()),
-            description: None,
-            position: Some(1),
-            max_users: None,
-            noenter: None,
-            silent: None,
-        },
-        ChannelConfig {
-            name: "Games".to_string(),
-            parent: Some("Lobby".to_string()),
-            description: None,
-            position: Some(2),
-            max_users: None,
-            noenter: None,
-            silent: None,
-        },
-        ChannelConfig {
-            name: "AFK".to_string(),
-            parent: Some("Root".to_string()),
-            description: None,
-            position: Some(3),
-            max_users: Some(1),
-            noenter: Some(true),
-            silent: None,
-        },
-    ];
+    let mut cfg = ServerConfig {
+        default_channel: "Lobby".to_string(),
+        channels: vec![
+            ChannelConfig {
+                name: "Lobby".to_string(),
+                parent: Some("Root".to_string()),
+                description: None,
+                position: Some(1),
+                max_users: None,
+                noenter: None,
+                silent: None,
+            },
+            ChannelConfig {
+                name: "Games".to_string(),
+                parent: Some("Lobby".to_string()),
+                description: None,
+                position: Some(2),
+                max_users: None,
+                noenter: None,
+                silent: None,
+            },
+            ChannelConfig {
+                name: "AFK".to_string(),
+                parent: Some("Root".to_string()),
+                description: None,
+                position: Some(3),
+                max_users: Some(1),
+                noenter: Some(true),
+                silent: None,
+            },
+        ],
+        ..Default::default()
+    };
     let port = 20000 + (rand::random::<u16>() % 30000);
     cfg.bind_port = port;
     cfg.udp_bind_port = 40000 + (rand::random::<u16>() % 20000);
@@ -108,8 +110,8 @@ async fn full_stack_text_and_udp() {
     );
 
     // Clear any leftover handshake events before sending messages
-    while let Ok(_) = b_events.try_recv() {}
-    while let Ok(_) = a_events.try_recv() {}
+    while b_events.try_recv().is_ok() {}
+    while a_events.try_recv().is_ok() {}
 
     let games_channel_id = {
         let state = a.state().await;
@@ -129,7 +131,7 @@ async fn full_stack_text_and_udp() {
     };
 
     let mut bob_observe_alice_rx = b.subscribe_events();
-    while let Ok(_) = bob_observe_alice_rx.try_recv() {}
+    while bob_observe_alice_rx.try_recv().is_ok() {}
 
     // TODO(issue): Flaky – server sometimes drops Alice's self UserState echo during channel move.
     assert!(
@@ -161,7 +163,7 @@ async fn full_stack_text_and_udp() {
     );
 
     let mut alice_observe_bob_rx = a.subscribe_events();
-    while let Ok(_) = alice_observe_bob_rx.try_recv() {}
+    while alice_observe_bob_rx.try_recv().is_ok() {}
 
     assert!(
         join_channel_and_wait(
@@ -190,7 +192,7 @@ async fn full_stack_text_and_udp() {
         "alice should observe bob moving to games"
     );
 
-    while let Ok(_) = a_events.try_recv() {}
+    while a_events.try_recv().is_ok() {}
 
     a.join_channel_by_name("AFK")
         .await
@@ -216,7 +218,7 @@ async fn full_stack_text_and_udp() {
     let mut channel_ok = false;
     for attempt in 0..5 {
         let mut rx = b.subscribe_events();
-        while let Ok(_) = rx.try_recv() {}
+        while rx.try_recv().is_ok() {}
         a.send_channel_message_by_name("Games", "hello from alice".to_string())
             .await
             .expect("alice text");
@@ -240,7 +242,7 @@ async fn full_stack_text_and_udp() {
     let mut whisper_ok = false;
     for attempt in 0..5 {
         let mut rx = b.subscribe_events();
-        while let Ok(_) = rx.try_recv() {}
+        while rx.try_recv().is_ok() {}
         let b_session = b.state().await.session_id.expect("bob session");
         a.send_private_message(b_session, "whisper from alice".to_string())
             .await
@@ -268,7 +270,7 @@ async fn full_stack_text_and_udp() {
 
     // UDP keepalive check (best effort)
     let mut udp_rx = a.subscribe_events();
-    while let Ok(_) = udp_rx.try_recv() {}
+    while udp_rx.try_recv().is_ok() {}
     if wait_for_event(&mut udp_rx, Duration::from_secs(5), |ev| {
         matches!(ev, MumbleEvent::UdpPing(_))
     })
@@ -288,7 +290,7 @@ async fn join_channel_and_wait(
     timeout: Duration,
 ) -> bool {
     let mut rx = conn.subscribe_events();
-    while let Ok(_) = rx.try_recv() {}
+    while rx.try_recv().is_ok() {}
     conn.join_channel_by_name(channel_name)
         .await
         .expect("join channel");

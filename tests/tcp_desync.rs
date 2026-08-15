@@ -108,11 +108,9 @@ async fn tcp_reader_does_not_desync_on_partial_preamble() {
 
     // Drain until we see the TextMessage.
     for _ in 0..8 {
-        if let Ok(event) = events.try_recv() {
-            if let MumbleEvent::TextMessage(text) = event {
-                assert_eq!(text.message, "hello".to_string());
-                return;
-            }
+        if let Ok(MumbleEvent::TextMessage(text)) = events.try_recv() {
+            assert_eq!(text.message, "hello".to_string());
+            return;
         }
         tokio::task::yield_now().await;
     }

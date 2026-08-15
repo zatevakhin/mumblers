@@ -56,17 +56,19 @@ async fn connect_client(
 async fn silent_channel_drops_audio() {
     init_tracing();
 
-    let mut cfg = ServerConfig::default();
-    cfg.default_channel = "Silent".to_string();
-    cfg.channels = vec![ChannelConfig {
-        name: "Silent".to_string(),
-        parent: Some("Root".to_string()),
-        description: None,
-        position: Some(1),
-        max_users: None,
-        noenter: None,
-        silent: Some(true),
-    }];
+    let cfg = ServerConfig {
+        default_channel: "Silent".to_string(),
+        channels: vec![ChannelConfig {
+            name: "Silent".to_string(),
+            parent: Some("Root".to_string()),
+            description: None,
+            position: Some(1),
+            max_users: None,
+            noenter: None,
+            silent: Some(true),
+        }],
+        ..Default::default()
+    };
     let (port, _handle) = start_server_with_config(cfg).await;
     sleep(Duration::from_millis(200)).await;
 
@@ -74,7 +76,7 @@ async fn silent_channel_drops_audio() {
     let (bob, _bob_session, _) = connect_client(port, "bob", true).await;
 
     let mut bob_rx = bob.subscribe_events();
-    while let Ok(_) = bob_rx.try_recv() {}
+    while bob_rx.try_recv().is_ok() {}
 
     // Alice sends audio -- should be dropped by the silent channel
     let packet = VoicePacket {
@@ -118,7 +120,7 @@ async fn multiple_simultaneous_talkers() {
     let (carol, _carol_session, _) = connect_client(port, "carol", true).await;
 
     let mut carol_rx = carol.subscribe_events();
-    while let Ok(_) = carol_rx.try_recv() {}
+    while carol_rx.try_recv().is_ok() {}
 
     // Both alice and bob send audio
     for i in 0..5u64 {
@@ -185,7 +187,7 @@ async fn positional_audio_roundtrip() {
     let (_bob, _bob_session, _) = connect_client(port, "bob", true).await;
 
     let mut bob_rx = _bob.subscribe_events();
-    while let Ok(_) = bob_rx.try_recv() {}
+    while bob_rx.try_recv().is_ok() {}
 
     let positions = [1.0f32, 2.0, 3.0];
     let packet = VoicePacket {
@@ -226,28 +228,30 @@ async fn positional_audio_roundtrip() {
 async fn text_message_to_channel_user_is_not_in() {
     init_tracing();
 
-    let mut cfg = ServerConfig::default();
-    cfg.default_channel = "Lobby".to_string();
-    cfg.channels = vec![
-        ChannelConfig {
-            name: "Lobby".to_string(),
-            parent: Some("Root".to_string()),
-            description: None,
-            position: Some(1),
-            max_users: None,
-            noenter: None,
-            silent: None,
-        },
-        ChannelConfig {
-            name: "Other".to_string(),
-            parent: Some("Root".to_string()),
-            description: None,
-            position: Some(2),
-            max_users: None,
-            noenter: None,
-            silent: None,
-        },
-    ];
+    let cfg = ServerConfig {
+        default_channel: "Lobby".to_string(),
+        channels: vec![
+            ChannelConfig {
+                name: "Lobby".to_string(),
+                parent: Some("Root".to_string()),
+                description: None,
+                position: Some(1),
+                max_users: None,
+                noenter: None,
+                silent: None,
+            },
+            ChannelConfig {
+                name: "Other".to_string(),
+                parent: Some("Root".to_string()),
+                description: None,
+                position: Some(2),
+                max_users: None,
+                noenter: None,
+                silent: None,
+            },
+        ],
+        ..Default::default()
+    };
     let (port, _handle) = start_server_with_config(cfg).await;
     sleep(Duration::from_millis(200)).await;
 
@@ -269,7 +273,7 @@ async fn text_message_to_channel_user_is_not_in() {
     sleep(Duration::from_millis(200)).await;
 
     let mut alice_rx = alice.subscribe_events();
-    while let Ok(_) = alice_rx.try_recv() {}
+    while alice_rx.try_recv().is_ok() {}
 
     // Alice sends text to "Other" channel (she's not in it)
     let text = mumblers::proto::mumble::TextMessage {
@@ -351,7 +355,7 @@ async fn rapid_connect_disconnect_cycles() {
     for i in 0..10 {
         let cfg = ConnectionConfig::builder("127.0.0.1")
             .port(port)
-            .username(&format!("rapid{i}"))
+            .username(format!("rapid{i}"))
             .accept_invalid_certs(true)
             .build();
         let mut client = MumbleConnection::new(cfg);

@@ -436,7 +436,7 @@ async fn test_send_private_message() {
     let mut event_count = 0;
     while event_count < 3 {
         if let Ok(event) = tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-            if let Ok(_) = event {
+            if event.is_ok() {
                 event_count += 1;
             }
         } else {
@@ -470,7 +470,7 @@ async fn test_move_user_to_channel() {
     let mut event_count = 0;
     while event_count < 3 {
         if let Ok(event) = tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-            if let Ok(_) = event {
+            if event.is_ok() {
                 event_count += 1;
             }
         } else {
@@ -501,7 +501,7 @@ async fn test_mute_deaf_operations() {
     let mut event_count = 0;
     while event_count < 3 {
         if let Ok(event) = tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
-            if let Ok(_) = event {
+            if event.is_ok() {
                 event_count += 1;
             }
         } else {

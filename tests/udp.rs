@@ -38,7 +38,7 @@ fn test_udp_audio_encoding_decoding() {
 
 #[test]
 fn test_udp_invalid_type() {
-    let data = vec![99u8, 0x01, 0x02]; // Unknown type
+    let data = [99u8, 0x01, 0x02]; // Unknown type
     let result = Ping::decode(&data[1..]);
     assert!(result.is_err());
 }
@@ -59,7 +59,7 @@ async fn test_udp_loopback_integration() {
     let server_task = tokio::spawn(async move {
         let mut buf = [0u8; 2048];
         while let Ok((len, addr)) = server_socket.recv_from(&mut buf).await {
-            if let Err(_) = server_socket.send_to(&buf[..len], addr).await {
+            if server_socket.send_to(&buf[..len], addr).await.is_err() {
                 break;
             }
         }

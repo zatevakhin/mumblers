@@ -10,14 +10,11 @@ fn load_dev_tls(cfg: &ServerConfig) -> Arc<rustls::ServerConfig> {
         let key_pem = std::fs::read(key_path).expect("read key");
         let mut cert_slice: &[u8] = &cert_pem;
         let certs_iter = rustls_pemfile::certs(&mut cert_slice);
-        let certs: Vec<_> = certs_iter.map(|r| r.unwrap()).collect();
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            certs_iter.map(|r| r.unwrap()).collect();
         let mut key_slice: &[u8] = &key_pem;
         let keys_iter = rustls_pemfile::pkcs8_private_keys(&mut key_slice);
         let keys: Vec<_> = keys_iter.map(|r| r.unwrap()).collect();
-        let certs: Vec<rustls::pki_types::CertificateDer<'static>> = certs
-            .into_iter()
-            .map(rustls::pki_types::CertificateDer::from)
-            .collect();
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(keys[0].clone_key());
         let config = rustls::ServerConfig::builder()
             .with_no_client_auth()

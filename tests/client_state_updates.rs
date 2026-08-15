@@ -76,7 +76,7 @@ async fn client_state_tracks_user_join_and_remove() {
     );
 
     let state = alice.state().await;
-    assert!(state.users.get(&bob_session).is_none());
+    assert!(!state.users.contains_key(&bob_session));
 
     handle.abort();
 }
@@ -188,8 +188,10 @@ async fn server_rejects_when_max_users_reached() {
         .try_init()
         .ok();
 
-    let mut cfg = ServerConfig::default();
-    cfg.max_users = Some(1);
+    let cfg = ServerConfig {
+        max_users: Some(1),
+        ..Default::default()
+    };
     let (port, _handle) = start_server_with_config(cfg).await;
     sleep(Duration::from_millis(200)).await;
 
@@ -269,8 +271,10 @@ async fn server_rejects_duplicate_username() {
 async fn server_rejects_empty_username_when_anonymous_disabled() {
     common::init_tracing();
 
-    let mut cfg = ServerConfig::default();
-    cfg.allow_anonymous = Some(false);
+    let cfg = ServerConfig {
+        allow_anonymous: Some(false),
+        ..Default::default()
+    };
     let (port, _handle) = start_server_with_config(cfg).await;
     sleep(Duration::from_millis(200)).await;
 
@@ -296,8 +300,10 @@ async fn server_rejects_empty_username_when_anonymous_disabled() {
 async fn server_rejects_wrong_password() {
     common::init_tracing();
 
-    let mut cfg = ServerConfig::default();
-    cfg.password = Some("secret123".to_string());
+    let cfg = ServerConfig {
+        password: Some("secret123".to_string()),
+        ..Default::default()
+    };
     let (port, _handle) = start_server_with_config(cfg).await;
     sleep(Duration::from_millis(200)).await;
 
@@ -317,8 +323,10 @@ async fn server_rejects_wrong_password() {
 async fn server_accepts_correct_password() {
     common::init_tracing();
 
-    let mut cfg = ServerConfig::default();
-    cfg.password = Some("secret123".to_string());
+    let cfg = ServerConfig {
+        password: Some("secret123".to_string()),
+        ..Default::default()
+    };
     let (port, _handle) = start_server_with_config(cfg).await;
     sleep(Duration::from_millis(200)).await;
 
