@@ -478,7 +478,7 @@ impl ReceivedAudioQueue {
         let position = self
             .queue
             .iter()
-            .position(|existing| existing.target_playback_time > chunk.target_playback_time);
+            .position(|existing| existing.frame_number > chunk.frame_number);
         match position {
             Some(index) => self.queue.insert(index, chunk),
             None => self.queue.push_back(chunk),
@@ -604,6 +604,20 @@ mod tests {
 mod audio_feature_tests {
     use super::*;
 
+    fn encode_three_packets() -> [VoicePacket; 3] {
+        let mut encoder = AudioEncoder::new(0).expect("encoder");
+        let frame = vec![0i16; encoder.frame_size()];
+        [
+            encoder.encode_frame(&frame).expect("encode first"),
+            encoder.encode_frame(&frame).expect("encode second"),
+            encoder.encode_frame(&frame).expect("encode third"),
+        ]
+    }
+
+    fn drain_frame_numbers(queue: &mut ReceivedAudioQueue) -> Vec<u64> {
+        std::iter::from_fn(|| queue.pop_front().map(|chunk| chunk.frame_number)).collect()
+    }
+
     #[test]
     fn encoder_produces_voice_packet() {
         let mut encoder = AudioEncoder::new(0).expect("encoder");
@@ -615,19 +629,59 @@ mod audio_feature_tests {
     }
 
     #[test]
-    fn received_queue_orders_frames() {
-        let mut encoder = AudioEncoder::new(0).expect("encoder");
-        let frame = vec![0i16; encoder.frame_size()];
-        let first = encoder.encode_frame(&frame).expect("encode first");
-        let second = encoder.encode_frame(&frame).expect("encode second");
-
+    fn received_queue_orders_scrambled_frames() {
+        let [first, second, third] = encode_three_packets();
         let mut queue = ReceivedAudioQueue::new().expect("queue");
+
+        queue.add(&third).expect("third");
+        queue.add(&first).expect("first");
         queue.add(&second).expect("second");
+
+        assert_eq!(
+            drain_frame_numbers(&mut queue),
+            vec![first.frame_number, second.frame_number, third.frame_number]
+        );
+    }
+
+    #[test]
+    fn received_queue_retains_duplicate_frames_in_arrival_order() {
+        let [first, second, third] = encode_three_packets();
+        let mut duplicate = second.clone();
+        duplicate.header = AudioHeader::Target(1);
+        let mut queue = ReceivedAudioQueue::new().expect("queue");
+
+        for packet in [&third, &first, &second, &duplicate] {
+            queue.add(packet).expect("packet");
+        }
+
+        let chunks: Vec<_> = std::iter::from_fn(|| queue.pop_front()).collect();
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.frame_number)
+                .collect::<Vec<_>>(),
+            vec![
+                first.frame_number,
+                second.frame_number,
+                duplicate.frame_number,
+                third.frame_number
+            ]
+        );
+        assert_eq!(chunks[1].header, second.header);
+        assert_eq!(chunks[2].header, duplicate.header);
+    }
+
+    #[test]
+    fn received_queue_emits_only_received_frames_across_gap() {
+        let [first, _second, third] = encode_three_packets();
+        let mut queue = ReceivedAudioQueue::new().expect("queue");
+
+        queue.add(&third).expect("third");
         queue.add(&first).expect("first");
 
-        let chunk1 = queue.pop_front().expect("pop first");
-        assert_eq!(chunk1.frame_number, first.frame_number);
-        let chunk2 = queue.pop_front().expect("pop second");
-        assert_eq!(chunk2.frame_number, second.frame_number);
+        assert_eq!(
+            drain_frame_numbers(&mut queue),
+            vec![first.frame_number, third.frame_number]
+        );
     }
 }
